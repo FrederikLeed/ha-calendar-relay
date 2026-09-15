@@ -14,7 +14,11 @@ with a per-child prefix.
 
 ## Current state
 
-- v0.1.0 built locally, not yet committed, pushed or published. Public repo, so no personal data.
+- v0.1.0 released 2026-09-15 and installed through HACS on the owner's production Home Assistant
+  (2026.9.1); the account and first relay are set up there by the owner. Public repo, so no personal data.
+- No GitHub Actions (owner's choice): lint, tests and the Home Assistant validations are run locally
+  before each release. The one CI run before the workflows were removed was green (lint, tests, hassfest,
+  HACS validation).
 - Tests: pytest-homeassistant-custom-component 0.13.365 (HA 2026.9.2, Python 3.14), including an
   end-to-end test with core `local_calendar` and a real Radicale 3.8.0 server in a thread.
 - Not yet tried against a live iCloud account. The iCloud discovery shapes come from research and
@@ -60,5 +64,4 @@ with a per-child prefix.
 - Zero-length events are written without DTEND (RFC 5545). Lone surrogates in source text become U+FFFD.
 - Minimum HA 2026.3.0 (local brand folder, Python 3.14 test stack). No `via_device_id`, so relay devices
   hang off the account entry and subentry only.
-- The HACS action checks repository description, topics and issues, which only exist once the GitHub repo
-  is created.
+- HACS validation also checks the repository description, topics and issues; they are set on GitHub.

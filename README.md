@@ -4,8 +4,6 @@
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test](https://github.com/FrederikLeed/ha-calendar-relay/actions/workflows/test.yml/badge.svg)](https://github.com/FrederikLeed/ha-calendar-relay/actions/workflows/test.yml)
-[![Lint](https://github.com/FrederikLeed/ha-calendar-relay/actions/workflows/lint.yml/badge.svg)](https://github.com/FrederikLeed/ha-calendar-relay/actions/workflows/lint.yml)
 
 Calendar Relay pushes events from Home Assistant calendar entities into a CalDAV calendar (iCloud,
 Nextcloud, Radicale and other CalDAV servers) and keeps them in step. It works one way and without churn:
