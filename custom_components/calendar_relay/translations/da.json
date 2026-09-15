@@ -1,0 +1,129 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Forbind en CalDAV-konto",
+        "description": "Videresendelser skriver i en kalender på denne konto. Til iCloud beholder du standardserveren, skriver e-mailadressen til din Apple-konto og bruger en appspecifik adgangskode: log ind på {app_password_url}, åbn Log ind og sikkerhed, vælg Appspecifikke adgangskoder, og opret en. Din almindelige adgangskode til Apple-kontoen virker ikke.",
+        "data": {
+          "url": "Server-URL",
+          "username": "Brugernavn",
+          "password": "Adgangskode"
+        },
+        "data_description": {
+          "url": "CalDAV-serveren, for eksempel standardserveren til iCloud.",
+          "username": "Til iCloud: e-mailadressen til din Apple-konto.",
+          "password": "Til iCloud: en appspecifik adgangskode."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Godkend CalDAV-kontoen igen",
+        "description": "Serveren accepterer ikke længere adgangskoden til {username}. Indtast en ny adgangskode. iCloud tilbagekalder appspecifikke adgangskoder, når adgangskoden til Apple-kontoen bliver ændret. Opret en ny på {app_password_url}.",
+        "data": {
+          "password": "Adgangskode"
+        }
+      },
+      "reconfigure": {
+        "title": "Omkonfigurer CalDAV-kontoen",
+        "description": "Ret server-URL eller brugernavn. Lad adgangskoden stå tom for at beholde den nuværende.",
+        "data": {
+          "url": "Server-URL",
+          "username": "Brugernavn",
+          "password": "Adgangskode"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Forkert brugernavn eller adgangskode. iCloud kræver en appspecifik adgangskode.",
+      "cannot_connect": "Kan ikke forbinde til CalDAV-serveren.",
+      "no_calendars": "Ingen kalender på kontoen modtager begivenheder, som du har lov til at skrive.",
+      "unknown": "Uventet fejl."
+    },
+    "abort": {
+      "already_configured": "Kontoen er allerede sat op.",
+      "reauth_successful": "Godkendelsen lykkedes.",
+      "reconfigure_successful": "Omkonfigurationen lykkedes."
+    }
+  },
+  "config_subentries": {
+    "relay": {
+      "entry_type": "Videresendelse",
+      "initiate_flow": {
+        "user": "Tilføj videresendelse",
+        "reconfigure": "Omkonfigurer videresendelse"
+      },
+      "step": {
+        "user": {
+          "title": "Tilføj videresendelse",
+          "description": "Kopiér begivenheder fra en kalender i Home Assistant til en kalender på denne konto, kun den ene vej. Begivenheder, der ikke er slut endnu, bliver sendt videre, så langt frem som du vælger.",
+          "data": {
+            "source_calendar": "Kildekalender",
+            "target_calendar": "Målkalender",
+            "title_filter": "Titelfilter",
+            "remove_filter": "Fjern filterteksten fra titlen",
+            "title_prefix": "Tekst foran titlen",
+            "look_ahead_days": "Dage frem"
+          },
+          "data_description": {
+            "source_calendar": "Den kalender i Home Assistant, der skal læses.",
+            "target_calendar": "Kalenderen på kontoen, som modtager begivenhederne.",
+            "title_filter": "Send kun begivenheder videre, hvis titlen indeholder denne tekst. Store og små bogstaver er lige meget. Lad feltet stå tomt for at sende alt videre.",
+            "remove_filter": "Fjern filterteksten og skilletegn som et kolon, der står tilbage foran, fra den videresendte titel.",
+            "title_prefix": "Tekst, der sættes foran hver videresendt titel, med et mellemrum til sidst, hvis du vil have det.",
+            "look_ahead_days": "Hvor mange dage frem der sendes videre, fra 1 til 365."
+          }
+        },
+        "reconfigure": {
+          "title": "Omkonfigurer videresendelse",
+          "description": "Vælger du en anden målkalender, flytter de videresendte begivenheder, der ikke er begyndt endnu, med over.",
+          "data": {
+            "source_calendar": "Kildekalender",
+            "target_calendar": "Målkalender",
+            "title_filter": "Titelfilter",
+            "remove_filter": "Fjern filterteksten fra titlen",
+            "title_prefix": "Tekst foran titlen",
+            "look_ahead_days": "Dage frem"
+          },
+          "data_description": {
+            "source_calendar": "Den kalender i Home Assistant, der skal læses.",
+            "target_calendar": "Kalenderen på kontoen, som modtager begivenhederne.",
+            "title_filter": "Send kun begivenheder videre, hvis titlen indeholder denne tekst. Store og små bogstaver er lige meget. Lad feltet stå tomt for at sende alt videre.",
+            "remove_filter": "Fjern filterteksten og skilletegn som et kolon, der står tilbage foran, fra den videresendte titel.",
+            "title_prefix": "Tekst, der sættes foran hver videresendt titel, med et mellemrum til sidst, hvis du vil have det.",
+            "look_ahead_days": "Hvor mange dage frem der sendes videre, fra 1 til 365."
+          }
+        }
+      },
+      "abort": {
+        "entry_not_loaded": "Kontoen er ikke indlæst. Ret kontoen først, og prøv så igen.",
+        "no_calendars": "Ingen kalender på kontoen modtager begivenheder, som du har lov til at skrive.",
+        "reconfigure_successful": "Omkonfigurationen lykkedes."
+      }
+    }
+  },
+  "entity": {
+    "button": {
+      "sync_now": {
+        "name": "Synkroniser nu"
+      }
+    },
+    "sensor": {
+      "last_sync": {
+        "name": "Seneste synkronisering",
+        "state_attributes": {
+          "relayed_events": {
+            "name": "Videresendte begivenheder"
+          },
+          "last_error": {
+            "name": "Seneste fejl"
+          }
+        }
+      }
+    }
+  },
+  "issues": {
+    "target_calendar_missing": {
+      "title": "Målkalenderen mangler for {relay}",
+      "description": "Videresendelsen {relay} kunne ikke skrive i kalenderen {calendar}, fordi serveren siger, at den ikke findes, eller fordi den ikke er en kalender på denne konto (for eksempel efter at kontoen er skiftet til en anden bruger). Den kan være slettet eller ikke længere delt med kontoen. Omkonfigurer videresendelsen for at vælge en anden målkalender, eller gendan kalenderen. Beskeden forsvinder efter den næste vellykkede synkronisering."
+    }
+  }
+}

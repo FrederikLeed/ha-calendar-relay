@@ -1,0 +1,17 @@
+{
+  "domain": "calendar_relay",
+  "name": "Calendar Relay",
+  "codeowners": [
+    "@FrederikLeed"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "calendar"
+  ],
+  "documentation": "https://github.com/FrederikLeed/ha-calendar-relay",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/FrederikLeed/ha-calendar-relay/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -1,0 +1,14 @@
+{
+  "entity": {
+    "button": {
+      "sync_now": {
+        "default": "mdi:calendar-sync"
+      }
+    },
+    "sensor": {
+      "last_sync": {
+        "default": "mdi:calendar-clock"
+      }
+    }
+  }
+}

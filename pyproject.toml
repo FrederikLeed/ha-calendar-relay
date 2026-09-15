@@ -1,0 +1,28 @@
+[project]
+name = "ha-calendar-relay"
+version = "0.1.0"
+description = "Home Assistant custom integration that relays calendar events into a CalDAV calendar"
+license = {text = "MIT"}
+requires-python = ">=3.14"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

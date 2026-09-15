@@ -1,0 +1,129 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect a CalDAV account",
+        "description": "Relays write into a calendar on this account. For iCloud, keep the default server URL, enter your Apple Account email address and use an app-specific password: sign in at {app_password_url}, open Sign-In and Security, choose App-Specific Passwords and create one. Your normal Apple Account password does not work.",
+        "data": {
+          "url": "Server URL",
+          "username": "Username",
+          "password": "Password"
+        },
+        "data_description": {
+          "url": "The CalDAV server, for example the default iCloud server.",
+          "username": "For iCloud, your Apple Account email address.",
+          "password": "For iCloud, an app-specific password."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate the CalDAV account",
+        "description": "The server no longer accepts the password for {username}. Enter a new password. iCloud revokes app-specific passwords when the Apple Account password changes; create a new one at {app_password_url}.",
+        "data": {
+          "password": "Password"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure the CalDAV account",
+        "description": "Change the server URL or the username. Leave the password empty to keep the current one.",
+        "data": {
+          "url": "Server URL",
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password. iCloud needs an app-specific password.",
+      "cannot_connect": "Cannot connect to the CalDAV server.",
+      "no_calendars": "No calendar on this account accepts events that you are allowed to write.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Reauthentication was successful.",
+      "reconfigure_successful": "Reconfiguration was successful."
+    }
+  },
+  "config_subentries": {
+    "relay": {
+      "entry_type": "Relay",
+      "initiate_flow": {
+        "user": "Add relay",
+        "reconfigure": "Reconfigure relay"
+      },
+      "step": {
+        "user": {
+          "title": "Add relay",
+          "description": "Copy events from a Home Assistant calendar into a calendar on this account, one way. Events that have not ended yet are relayed, as far ahead as the look-ahead.",
+          "data": {
+            "source_calendar": "Source calendar",
+            "target_calendar": "Target calendar",
+            "title_filter": "Title filter",
+            "remove_filter": "Remove filter text from title",
+            "title_prefix": "Title prefix",
+            "look_ahead_days": "Look-ahead (days)"
+          },
+          "data_description": {
+            "source_calendar": "The Home Assistant calendar to read.",
+            "target_calendar": "The calendar on this account that receives the events.",
+            "title_filter": "Only relay events whose title contains this text. Case does not matter. Leave empty to relay everything.",
+            "remove_filter": "Remove the filter text, and separators such as a colon left in front, from the relayed title.",
+            "title_prefix": "Text put in front of every relayed title, including any space you want after it.",
+            "look_ahead_days": "How many days ahead to relay, from 1 to 365."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure relay",
+          "description": "Choosing another target calendar moves the relayed events that have not started yet to it.",
+          "data": {
+            "source_calendar": "Source calendar",
+            "target_calendar": "Target calendar",
+            "title_filter": "Title filter",
+            "remove_filter": "Remove filter text from title",
+            "title_prefix": "Title prefix",
+            "look_ahead_days": "Look-ahead (days)"
+          },
+          "data_description": {
+            "source_calendar": "The Home Assistant calendar to read.",
+            "target_calendar": "The calendar on this account that receives the events.",
+            "title_filter": "Only relay events whose title contains this text. Case does not matter. Leave empty to relay everything.",
+            "remove_filter": "Remove the filter text, and separators such as a colon left in front, from the relayed title.",
+            "title_prefix": "Text put in front of every relayed title, including any space you want after it.",
+            "look_ahead_days": "How many days ahead to relay, from 1 to 365."
+          }
+        }
+      },
+      "abort": {
+        "entry_not_loaded": "The account is not loaded. Fix the account first, then try again.",
+        "no_calendars": "No calendar on this account accepts events that you are allowed to write.",
+        "reconfigure_successful": "Reconfiguration was successful."
+      }
+    }
+  },
+  "entity": {
+    "button": {
+      "sync_now": {
+        "name": "Sync now"
+      }
+    },
+    "sensor": {
+      "last_sync": {
+        "name": "Last sync",
+        "state_attributes": {
+          "relayed_events": {
+            "name": "Relayed events"
+          },
+          "last_error": {
+            "name": "Last error"
+          }
+        }
+      }
+    }
+  },
+  "issues": {
+    "target_calendar_missing": {
+      "title": "Target calendar missing for {relay}",
+      "description": "The relay {relay} could not write into the calendar {calendar}: the server says it does not exist, or it is not a calendar of this account (for example after the account was changed to another user). It may have been deleted or is no longer shared with this account. Reconfigure the relay to choose another target calendar, or restore the calendar. This message goes away after the next successful sync."
+    }
+  }
+}
