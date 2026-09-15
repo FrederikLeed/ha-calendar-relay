@@ -147,8 +147,8 @@ A relay can be changed later with **Reconfigure** on the relay. Each relay gets 
   reauthentication, even when the real cause is something a new password cannot fix.
 - iCloud limits CalDAV traffic without publishing the limits. Relays only write changes, but many relays
   with long look-aheads still mean more requests.
-- The integration has been tested against Radicale and against recorded iCloud response shapes, not yet
-  against a live iCloud account.
+- Tested against Radicale in the test suite and against a live iCloud account (create, unchanged resync
+  and delete of an event, with the shared Family calendar offered as a target).
 
 ## Troubleshooting
 

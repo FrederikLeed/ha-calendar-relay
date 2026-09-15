@@ -21,9 +21,9 @@ with a per-child prefix.
   HACS validation).
 - Tests: pytest-homeassistant-custom-component 0.13.365 (HA 2026.9.2, Python 3.14), including an
   end-to-end test with core `local_calendar` and a real Radicale 3.8.0 server in a thread.
-- Not yet tried against a live iCloud account. The iCloud discovery shapes come from research and
-  recorded responses in other projects. The first live test should record the Family calendar's
-  privilege set and whether PUT returns an ETag.
+- Verified against a live iCloud account on 2026-09-15: discovery lands on the account's partition host
+  (pNN-caldav.icloud.com), the shared Family calendar is offered as writable, a relayed event was created,
+  left alone by a repeat sync, and deleted when the filter stopped matching.
 
 ## How it works
 
