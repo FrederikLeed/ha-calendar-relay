@@ -21,8 +21,14 @@ from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.calendar_relay.const import DOMAIN, WAZE_DOMAIN, WAZE_SERVICE
-from custom_components.calendar_relay.ics import content_hash, render_event
-from custom_components.calendar_relay.relay import Relay, event_key, resource_id
+from custom_components.calendar_relay.ics import StructuredLocation, content_hash, render_event, vtimezone_lines
+from custom_components.calendar_relay.relay import (
+    Relay,
+    event_key,
+    place_fingerprint,
+    resource_id,
+    travel_fingerprint,
+)
 
 from .conftest import (
     CALL_UP,
@@ -172,27 +178,37 @@ async def test_structured_location_title_and_address(
     assert first_line(fake_dav, "X-APPLE-STRUCTURED-LOCATION") == expected
 
 
-async def test_relay_saved_by_version_0_1_is_not_rewritten(
+async def test_relay_saved_by_version_0_1_gets_the_defaults_of_the_new_settings(
     hass: HomeAssistant, source_calendar: FakeCalendar, fake_dav: FakeDav, hass_storage: dict
 ) -> None:
-    """A relay without the new settings gets their defaults, and an event without coordinates keeps its hash."""
-    event = timed(f"{CALL_UP}Home - Away", KICKOFF, description="Bring water", location="Pitch 2")
+    """A relay without the new settings gets their defaults, and an all-day event without coordinates keeps its hash.
+
+    Timed events are rewritten once for the home time zone; see test_upgrade_from_0_2_0_rewrites_timed_events_once.
+    """
+    event = CalendarEvent(
+        start=date(2026, 9, 20),
+        end=date(2026, 9, 21),
+        summary=f"{CALL_UP}Cup day",
+        uid="cup",
+        description="Bring water",
+        location="Pitch 2",
+    )
     source_calendar.events = [event]
     key = event_key(event)
     rid = resource_id(RELAY_ID, key)
     old_body = render_event(
         uid=f"{rid}@calendar-relay",
-        summary=f"{PREFIX}Home - Away",
-        start=KICKOFF,
-        end=KICKOFF + timedelta(hours=2),
+        summary=f"{PREFIX}Cup day",
+        start=date(2026, 9, 20),
+        end=date(2026, 9, 21),
         description="Bring water",
         location="Pitch 2",
     )
     record = {
         "href": f"{FAMILY_URL}relay-{rid}.ics",
         "hash": content_hash(old_body),
-        "start": "2026-09-20T10:00:00+00:00",
-        "end": "2026-09-20T12:00:00+00:00",
+        "start": "2026-09-20",
+        "end": "2026-09-21",
         "target": FAMILY_URL,
     }
     hass_storage[STORE_KEY] = {"version": 1, "minor_version": 1, "key": STORE_KEY, "data": {"events": {key: record}}}
@@ -210,16 +226,16 @@ async def test_relay_saved_by_version_0_1_is_not_rewritten(
     assert relay_of(entry).last_error is None
 
 
-async def test_fixed_travel_time_with_buffer_and_leave_reminder(
+async def test_fixed_travel_time_with_arrive_early_and_leave_reminder(
     hass: HomeAssistant, source_calendar: FakeCalendar, fake_dav: FakeDav
 ) -> None:
-    """A leave line tops the description; the travel block and the alarm cover travel time plus buffer."""
+    """A leave line tops the description; the travel block and the alarm cover travel time plus arrive early."""
     source_calendar.events = [match()]
     entry = make_entry(relay_subentry(travel_time="fixed", travel_minutes=20, buffer_minutes=10, leave_reminder=True))
     await setup_entry(hass, entry)
 
     event = lines(fake_dav)
-    assert f"DESCRIPTION:Leave at 11:30 (about 20 min drive)\\n{DESCRIPTION}" in event
+    assert f"DESCRIPTION:Leave at 11:30 (about 20 min drive + 10 min early)\\n{DESCRIPTION}" in event
     index = event.index(PLACE)
     assert event[index + 1 : index + 7] == [
         "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT30M",
@@ -234,19 +250,38 @@ async def test_fixed_travel_time_with_buffer_and_leave_reminder(
         assert private not in body
 
 
-@pytest.mark.parametrize("language", ["da", "da-DK"])
-async def test_leave_line_in_danish(
-    hass: HomeAssistant, source_calendar: FakeCalendar, fake_dav: FakeDav, language: str
+@pytest.mark.parametrize(
+    ("language", "arrive_early", "line", "duration"),
+    [
+        ("en", 0, "Leave at 11:40 (about 20 min drive)", "PT20M"),
+        ("en", 15, "Leave at 11:25 (about 20 min drive + 15 min early)", "PT35M"),
+        ("da", 0, "Afgang: 11:40 (ca. 20 min. kørsel)", "PT20M"),
+        ("da-DK", 15, "Afgang: 11:25 (ca. 20 min. kørsel + 15 min. før tid)", "PT35M"),
+    ],
+)
+async def test_leave_line_in_both_languages_names_arrive_early(
+    hass: HomeAssistant,
+    source_calendar: FakeCalendar,
+    fake_dav: FakeDav,
+    language: str,
+    arrive_early: int,
+    line: str,
+    duration: str,
 ) -> None:
-    """Danish Home Assistant gets a Danish leave line; a location text without coordinates is a place too."""
+    """Danish Home Assistant gets a Danish leave line, which names arrive early unless it is 0.
+
+    The travel block and the reminder cover the drive plus arrive early. A location text without
+    coordinates is a place too.
+    """
     hass.config.language = language
     source_calendar.events = [match(description="Bring water", location="Example Hall")]
-    await setup_entry(hass, make_entry(relay_subentry(travel_time="fixed", travel_minutes=20)))
+    subentry = relay_subentry(travel_time="fixed", travel_minutes=20, buffer_minutes=arrive_early, leave_reminder=True)
+    await setup_entry(hass, make_entry(subentry))
 
     event = lines(fake_dav)
-    assert "DESCRIPTION:Afgang: 11:40 (ca. 20 min. kørsel)\\nBring water" in event
-    assert "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT20M" in event
-    assert "BEGIN:VALARM" not in event
+    assert f"DESCRIPTION:{line}\\nBring water" in event
+    assert f"X-APPLE-TRAVEL-DURATION;VALUE=DURATION:{duration}" in event
+    assert f"TRIGGER:-{duration}" in event
     assert first_line(fake_dav, "X-APPLE-STRUCTURED-LOCATION") is None
 
 
@@ -682,6 +717,124 @@ async def test_travel_time_and_retry_of_a_withdrawn_event_are_forgotten(
 def href_of(event: CalendarEvent) -> str:
     """Return the href a source event is relayed to in the Family calendar."""
     return f"{FAMILY_URL}relay-{resource_id(RELAY_ID, event_key(event))}.ics"
+
+
+def uid_of(event: CalendarEvent) -> str:
+    """Return the UID of the relayed copy of a source event."""
+    return f"{resource_id(RELAY_ID, event_key(event))}@calendar-relay"
+
+
+async def test_upgrade_from_0_2_0_rewrites_timed_events_once(
+    hass: HomeAssistant,
+    source_calendar: FakeCalendar,
+    fake_dav: FakeDav,
+    waze: FakeWaze,
+    hass_storage: dict,
+) -> None:
+    """Timed events that 0.2.0 wrote in UTC get local times in one write each, and nothing follows.
+
+    The only changes are the times, the VTIMEZONE and the arrive early text. The travel time 0.2.0
+    stored is used as it is, so Waze is not asked; an all-day event is not rewritten at all.
+    """
+    trip = match()
+    training = timed(f"{CALL_UP}Training match", KICKOFF + timedelta(days=1), uid="training")
+    cup = CalendarEvent(start=date(2026, 9, 26), end=date(2026, 9, 27), summary=f"{CALL_UP}Cup day", uid="cup")
+    source_calendar.events = [trip, training, cup]
+    # What 0.2.0 wrote: times in UTC, and a leave line without arrive early.
+    trip_body = render_event(
+        uid=uid_of(trip),
+        summary=f"{PREFIX}Home - Away",
+        start=KICKOFF,
+        end=KICKOFF + timedelta(hours=2),
+        description=f"Leave at 11:20 (about 25 min drive)\n{MAP_LINK}",
+        location=VENUE,
+        structured_location=StructuredLocation(VENUE, 55.123456, 10.654321),
+        travel_minutes=40,
+        alarm_minutes=40,
+    )
+    training_start = KICKOFF + timedelta(days=1)
+    training_body = render_event(
+        uid=uid_of(training),
+        summary=f"{PREFIX}Training match",
+        start=training_start,
+        end=training_start + timedelta(hours=2),
+    )
+    cup_body = render_event(uid=uid_of(cup), summary=f"{PREFIX}Cup day", start=date(2026, 9, 26), end=date(2026, 9, 27))
+    written = [
+        (trip, trip_body, "2026-09-20T10:00:00+00:00", "2026-09-20T12:00:00+00:00"),
+        (training, training_body, "2026-09-21T10:00:00+00:00", "2026-09-21T12:00:00+00:00"),
+        (cup, cup_body, "2026-09-26", "2026-09-27"),
+    ]
+    hass_storage[STORE_KEY] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": STORE_KEY,
+        "data": {
+            "events": {
+                event_key(event): {
+                    "href": href_of(event),
+                    "hash": content_hash(body),
+                    "start": start,
+                    "end": end,
+                    "target": FAMILY_URL,
+                }
+                for event, body, start, end in written
+            },
+            "travel": {
+                event_key(trip): {
+                    "minutes": 25,
+                    "fingerprint": travel_fingerprint(HOME, DESTINATION, "eu"),
+                    "place": place_fingerprint(DESTINATION),
+                    "computed_at": "2026-09-15T09:00:00+00:00",
+                    "realtime": False,
+                    "start": "2026-09-20T10:00:00+00:00",
+                }
+            },
+            "travel_retry": {},
+        },
+    }
+    fake_dav.resources = {href_of(event): body for event, body, _start, _end in written}
+    entry = waze_entry(buffer_minutes=15, leave_reminder=True)
+    await setup_entry(hass, entry)
+
+    assert sorted(fake_dav.calls) == sorted([("PUT", href_of(trip)), ("PUT", href_of(training))])
+    assert waze.calls == []
+    vtimezone = vtimezone_lines("Europe/Copenhagen", 2026)
+
+    def upgraded(body: str, changes: dict[str, str]) -> list[str]:
+        expected = [changes.get(line, line) for line in body.replace("\r\n ", "").split("\r\n")]
+        expected[3:3] = vtimezone
+        expected.insert(expected.index("BEGIN:VEVENT") + 2, "DTSTAMP:20260915T100000Z")
+        return expected
+
+    assert unfolded(fake_dav, trip) == upgraded(
+        trip_body,
+        {
+            "DTSTART:20260920T100000Z": "DTSTART;TZID=Europe/Copenhagen:20260920T120000",
+            "DTEND:20260920T120000Z": "DTEND;TZID=Europe/Copenhagen:20260920T140000",
+            f"DESCRIPTION:Leave at 11:20 (about 25 min drive)\\n{DESCRIPTION}": (
+                f"DESCRIPTION:Leave at 11:20 (about 25 min drive + 15 min early)\\n{DESCRIPTION}"
+            ),
+        },
+    )
+    assert unfolded(fake_dav, training) == upgraded(
+        training_body,
+        {
+            "DTSTART:20260921T100000Z": "DTSTART;TZID=Europe/Copenhagen:20260921T120000",
+            "DTEND:20260921T120000Z": "DTEND;TZID=Europe/Copenhagen:20260921T140000",
+        },
+    )
+    assert fake_dav.resources[href_of(cup)] == cup_body
+
+    fake_dav.calls.clear()
+    await relay_of(entry).async_sync()
+    await relay_of(entry).async_sync()
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await relay_of(entry).async_sync()
+    assert fake_dav.calls == []
+    assert waze.calls == []
+    assert relay_of(entry).last_error is None
 
 
 def unfolded(fake_dav: FakeDav, event: CalendarEvent) -> list[str]:

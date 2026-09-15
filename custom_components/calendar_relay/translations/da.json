@@ -66,7 +66,7 @@
             "travel_time": "Rejsetid",
             "travel_minutes": "Fast rejsetid",
             "waze_region": "Waze-region",
-            "buffer_minutes": "Ekstra tid",
+            "buffer_minutes": "Vær der før tid",
             "leave_reminder": "Påmindelse om afgang"
           },
           "data_description": {
@@ -80,7 +80,7 @@
             "travel_time": "Tilføj et afgangstidspunkt til begivenheder med et klokkeslæt og et sted: et fast antal minutter eller den køretid, som Waze Travel Time finder fra dit hjem i Home Assistant.",
             "travel_minutes": "Minutter på vejen, når rejsetiden er et fast antal minutter, fra 1 til 480.",
             "waze_region": "Waze-serverens region, som bruges, når rejsetiden kommer fra Waze Travel Time.",
-            "buffer_minutes": "Minutter, der lægges oven i rejsetiden, for eksempel til parkering, fra 0 til 120. Afgang er starttidspunktet minus rejsetiden og den ekstra tid.",
+            "buffer_minutes": "Hvor mange minutter før begivenheden starter, du vil være der, for eksempel 15 minutter før mødetidspunktet. Lægges oven i rejsetiden, så afgang er starttidspunktet minus begge dele. Fra 0 til 120.",
             "leave_reminder": "Tilføj en påmindelse ved afgang. I en delt iCloud-kalender ringer den kun på enheder, der er logget ind på denne konto. De andre slår Tid til at tage af sted til på deres egen iPhone."
           }
         },
@@ -98,7 +98,7 @@
             "travel_time": "Rejsetid",
             "travel_minutes": "Fast rejsetid",
             "waze_region": "Waze-region",
-            "buffer_minutes": "Ekstra tid",
+            "buffer_minutes": "Vær der før tid",
             "leave_reminder": "Påmindelse om afgang"
           },
           "data_description": {
@@ -112,7 +112,7 @@
             "travel_time": "Tilføj et afgangstidspunkt til begivenheder med et klokkeslæt og et sted: et fast antal minutter eller den køretid, som Waze Travel Time finder fra dit hjem i Home Assistant.",
             "travel_minutes": "Minutter på vejen, når rejsetiden er et fast antal minutter, fra 1 til 480.",
             "waze_region": "Waze-serverens region, som bruges, når rejsetiden kommer fra Waze Travel Time.",
-            "buffer_minutes": "Minutter, der lægges oven i rejsetiden, for eksempel til parkering, fra 0 til 120. Afgang er starttidspunktet minus rejsetiden og den ekstra tid.",
+            "buffer_minutes": "Hvor mange minutter før begivenheden starter, du vil være der, for eksempel 15 minutter før mødetidspunktet. Lægges oven i rejsetiden, så afgang er starttidspunktet minus begge dele. Fra 0 til 120.",
             "leave_reminder": "Tilføj en påmindelse ved afgang. I en delt iCloud-kalender ringer den kun på enheder, der er logget ind på denne konto. De andre slår Tid til at tage af sted til på deres egen iPhone."
           }
         }

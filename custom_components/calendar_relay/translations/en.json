@@ -66,7 +66,7 @@
             "travel_time": "Travel time",
             "travel_minutes": "Fixed travel time",
             "waze_region": "Waze region",
-            "buffer_minutes": "Extra buffer",
+            "buffer_minutes": "Arrive early",
             "leave_reminder": "Leave reminder"
           },
           "data_description": {
@@ -80,7 +80,7 @@
             "travel_time": "Add a leave time to events that have a start time and a place: a fixed number of minutes, or the drive time Waze Travel Time finds from your Home Assistant home location.",
             "travel_minutes": "Minutes of travel when travel time is set to fixed minutes, from 1 to 480.",
             "waze_region": "The Waze server region, used when the travel time comes from Waze Travel Time.",
-            "buffer_minutes": "Minutes added to the travel time, for example for parking, from 0 to 120. The leave time is the start minus the travel time and this buffer.",
+            "buffer_minutes": "Minutes before the event starts you want to be there, for example 15 minutes before the meeting time. Added to the travel time, so the leave time is the start minus both. From 0 to 120.",
             "leave_reminder": "Add an alert at the leave time. In a shared iCloud calendar it only rings on devices signed in to this account; other members turn on Time to Leave on their own iPhone."
           }
         },
@@ -98,7 +98,7 @@
             "travel_time": "Travel time",
             "travel_minutes": "Fixed travel time",
             "waze_region": "Waze region",
-            "buffer_minutes": "Extra buffer",
+            "buffer_minutes": "Arrive early",
             "leave_reminder": "Leave reminder"
           },
           "data_description": {
@@ -112,7 +112,7 @@
             "travel_time": "Add a leave time to events that have a start time and a place: a fixed number of minutes, or the drive time Waze Travel Time finds from your Home Assistant home location.",
             "travel_minutes": "Minutes of travel when travel time is set to fixed minutes, from 1 to 480.",
             "waze_region": "The Waze server region, used when the travel time comes from Waze Travel Time.",
-            "buffer_minutes": "Minutes added to the travel time, for example for parking, from 0 to 120. The leave time is the start minus the travel time and this buffer.",
+            "buffer_minutes": "Minutes before the event starts you want to be there, for example 15 minutes before the meeting time. Added to the travel time, so the leave time is the start minus both. From 0 to 120.",
             "leave_reminder": "Add an alert at the leave time. In a shared iCloud calendar it only rings on devices signed in to this account; other members turn on Time to Leave on their own iPhone."
           }
         }

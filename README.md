@@ -33,7 +33,8 @@ From KampKlar 0.7.0 a match carries its address as location and a `Kort: https:/
 link in its description. [Place details](#location-details), on by default, then give the entry a map in
 Apple Calendar, and with [travel time](#travel-time) from Waze Travel Time its notes start with
 `Leave at 09:35 (about 25 min drive)`. If KampKlar starts events at the meeting time, the leave time is
-counted back from the meeting time.
+counted back from the meeting time, and [arrive early](#arrive-early) adds the minutes the child wants to be
+there before it: `Leave at 09:20 (about 25 min drive + 15 min early)`.
 
 ## Installation
 
@@ -94,11 +95,17 @@ Open the account entry and choose **Add relay**:
 | Travel time | Off (default), Fixed minutes or Waze Travel Time. See [Travel time](#travel-time). |
 | Fixed travel time | Minutes of travel for Fixed minutes, 1 to 480 (default 15). |
 | Waze region | The Waze server region for Waze Travel Time: Europe (default), United States, North America, Israel or Australia. |
-| Extra buffer | Minutes added to the travel time, for example for parking, 0 to 120 (default 0). |
+| Arrive early | Minutes before the event starts you want to be there, added to the travel time, 0 to 120 (default 0). See [Arrive early](#arrive-early). |
 | Leave reminder | An alert at the leave time. Off by default. See [Leave reminder](#leave-reminder) for who hears it. |
 
-Relays created with an earlier version get the defaults above. Nothing is rewritten on upgrade unless an
-event has coordinates, which then get their place details once.
+Relays created with an earlier version get the defaults above, and a relay set up with Extra buffer (0.2.0)
+keeps that value as Arrive early.
+
+**Upgrading to 0.2.1** rewrites each relayed event that has a start time once, because times are now
+written in Home Assistant's time zone (see [How it works](#how-it-works)). That happens in the first sync
+after the upgrade and, in time zones with yearly daylight saving rules, never again. Travel times already
+stored are kept, so Waze Travel Time is not asked again, and all-day events are not rewritten. As with any change, an event that has already started when it
+is rewritten loses its leave line and reminder.
 
 A relay can be changed later with **Reconfigure** on the relay. Each relay gets a device with two entities:
 
@@ -168,13 +175,22 @@ The relayed event then gets:
 
 - A first line in its description, in Home Assistant's language: `Leave at 11:35 (about 25 min drive)`,
   or in Danish `Afgang: 11:35 (ca. 25 min. kørsel)`. The leave time is the start minus the travel time
-  and the extra buffer, in Home Assistant's time zone. When it falls on the day before the start, the line
-  says so: `Leave at 23:45 the day before (about 30 min drive)`, or `Afgang: 23:45 dagen før (ca. 30 min.
-  kørsel)`.
-- Apple's `X-APPLE-TRAVEL-DURATION`, covering the travel time plus the buffer, so Apple Calendar draws a
+  and [arrive early](#arrive-early), in Home Assistant's time zone. When arrive early is set, the line
+  names it: `Leave at 11:20 (about 25 min drive + 15 min early)`, or `Afgang: 11:20 (ca. 25 min. kørsel +
+  15 min. før tid)`. When the leave time falls on the day before the start, the line says so:
+  `Leave at 23:45 the day before (about 30 min drive)`, or `Afgang: 23:45 dagen før (ca. 30 min. kørsel)`.
+- Apple's `X-APPLE-TRAVEL-DURATION`, covering the travel time plus arrive early, so Apple Calendar draws a
   travel block that starts at the leave time.
 
 The home location is never written into events.
+
+### Arrive early
+
+Arrive early is how many minutes before the event starts you want to be there. Say a match event starts at
+11:00, the meeting time, the child likes to be there 15 minutes before the meeting time, and the drive
+takes 50 minutes. With Arrive early set to 15 the notes start with
+`Leave at 09:55 (about 50 min drive + 15 min early)`, and the travel block and the
+[leave reminder](#leave-reminder) start at 09:55 too. At 0 the line only names the drive.
 
 ### Setting up Waze Travel Time
 
@@ -264,8 +280,15 @@ written without alerts.
   event is replaced in place.
 - **What is written**: the title (filtered and prefixed), start and end, description and location, and
   with the settings above Apple's structured location, the leave line, Apple's travel duration and an
-  alert. Timed events are written in UTC, all-day events as dates. No organizer or attendees are written,
-  so nobody gets an invitation.
+  alert. No organizer or attendees are written, so nobody gets an invitation.
+- **Times**: timed events are written as local times in Home Assistant's time zone (**Settings** >
+  **System** > **General**), with the zone's yearly daylight saving rules, the same in every event, so
+  Apple Calendar shows them in the family's time zone instead of adding a GMT time. All-day events are
+  written as dates. With the time zone set to UTC, times are written in UTC. A time in the hour that repeats
+  when clocks go back is written in UTC the second time round, because as a local time it would read as the
+  first. Changing Home Assistant's time zone rewrites each timed event once. In a zone whose clock changes
+  follow no yearly rule, such as Morocco's, the changes of the current year and the next two are written
+  instead, so its timed events are rewritten once at the start of each year.
 - **Sync state**: what was written where is kept in Home Assistant's storage
   (`.storage/calendar_relay.<relay id>`), so nothing is rewritten after a restart. Waze travel times are
   kept there too: the minutes, when they were computed, whether with live traffic, the event start they
@@ -316,14 +339,15 @@ written without alerts.
 - iCloud limits CalDAV traffic without publishing the limits. Relays only write changes, but many relays
   with long look-aheads still mean more requests.
 - Tested against Radicale in the test suite and against a live iCloud account (create, unchanged resync
-  and delete of an event, with the shared Family calendar offered as a target). Place details, travel time
-  and the leave reminder are tested against Radicale only, not yet on iCloud or an iPhone.
+  and delete of an event, with the shared Family calendar offered as a target). Place details, the travel
+  block, the leave line and the leave reminder have been seen working on an iPhone through iCloud, on the
+  device of the Apple Account the relay uses.
 
 ## Troubleshooting
 
 **Settings** > **Devices & services** > **Calendar Relay** > three-dot menu > **Download diagnostics**
 gives a file you can attach to an issue. The integration's part contains counts, states and each relay's
-settings (place details, travel time mode, buffer, leave reminder) plus whether the Waze Travel Time action
+settings (place details, travel time mode, arrive early as `buffer_minutes`, leave reminder) plus whether the Waze Travel Time action
 is available: no username, password, server or calendar addresses, entity ids, titles, places or
 coordinates. Home Assistant also adds any open repair issues to the file, and a "target calendar missing"
 issue names the relay, so check the file before you share it if a relay is named after a person.

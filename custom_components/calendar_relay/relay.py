@@ -171,18 +171,23 @@ def is_danish(language: str | None) -> bool:
     return re.split(r"[-_]", language or "", maxsplit=1)[0].lower() == "da"
 
 
-def leave_text(language: str | None, leave_at: datetime, travel_minutes: int, days_before: int = 0) -> str:
+def leave_text(
+    language: str | None, leave_at: datetime, travel_minutes: int, days_before: int = 0, early_minutes: int = 0
+) -> str:
     """Return the leave line of the description in Danish or English, with leave_at as local 24-hour time.
 
     days_before says how many local dates the leave time lies before the start, so a line such as
-    23:45 is not read as a time on the event's own day.
+    23:45 is not read as a time on the event's own day. early_minutes, the relay's arrive early
+    setting, is named after the drive when it is not 0, so the line adds up to the leave time.
     """
     clock = f"{leave_at.hour:02d}:{leave_at.minute:02d}"
     if is_danish(language):
         day = " dagen før" if days_before == 1 else f" {days_before} dage før" if days_before > 1 else ""
-        return f"Afgang: {clock}{day} (ca. {travel_minutes} min. kørsel)"
+        early = f" + {early_minutes} min. før tid" if early_minutes else ""
+        return f"Afgang: {clock}{day} (ca. {travel_minutes} min. kørsel{early})"
     day = " the day before" if days_before == 1 else f" {days_before} days before" if days_before > 1 else ""
-    return f"Leave at {clock}{day} (about {travel_minutes} min drive)"
+    early = f" + {early_minutes} min early" if early_minutes else ""
+    return f"Leave at {clock}{day} (about {travel_minutes} min drive{early})"
 
 
 def round_travel_minutes(duration: float) -> int:
@@ -405,14 +410,17 @@ class PlannedEvent:
     buffer_minutes: int = 0
     leave_reminder: bool = False
     language: str = "en"
+    # The tz database name that timed events are written in: Home Assistant's time zone.
+    time_zone: str | None = None
     content_hash: str = ""
 
     def render(self, dtstamp: datetime | None = None) -> str:
         """Render the event. Without dtstamp the text is stable and used for change detection.
 
         With a travel time, a timed event gets a leave line at the top of its description,
-        Apple's travel duration covering travel time plus buffer, and optionally an alarm
-        at the leave time. The leave line names the day when it is before the start's local date.
+        Apple's travel duration covering travel time plus arrive early (buffer_minutes), and
+        optionally an alarm at the leave time. The leave line names the day when it is before
+        the start's local date, and names arrive early when it is not 0.
         """
         description = self.description
         leave: int | None = None
@@ -420,7 +428,7 @@ class PlannedEvent:
             leave = self.travel_minutes + self.buffer_minutes
             leave_at = dt_util.as_local(self.start - timedelta(minutes=leave))
             days_before = (dt_util.as_local(self.start).date() - leave_at.date()).days
-            line = leave_text(self.language, leave_at, self.travel_minutes, days_before)
+            line = leave_text(self.language, leave_at, self.travel_minutes, days_before, self.buffer_minutes)
             description = f"{line}\n{description}" if description else line
         return render_event(
             uid=self.uid,
@@ -433,6 +441,7 @@ class PlannedEvent:
             travel_minutes=leave,
             alarm_minutes=leave if self.leave_reminder else None,
             dtstamp=dtstamp,
+            time_zone=self.time_zone,
         )
 
 
@@ -713,6 +722,7 @@ class Relay:
             buffer_minutes=config.buffer_minutes,
             leave_reminder=config.leave_reminder,
             language=self.hass.config.language,
+            time_zone=self.hass.config.time_zone,
         )
         # Travel time only applies to timed events with a place to travel to.
         destination = travel_destination(event.location, coordinates) if isinstance(start, datetime) else None

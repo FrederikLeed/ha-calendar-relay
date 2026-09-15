@@ -173,6 +173,18 @@ def test_leave_text_on_an_earlier_day() -> None:
     assert leave_text("da-DK", leave_at, 480, 2) == "Afgang: 23:45 2 dage før (ca. 480 min. kørsel)"
 
 
+def test_leave_text_names_arrive_early() -> None:
+    """Arrive early is named after the drive when it is not 0, so the line adds up to the leave time."""
+    leave_at = datetime(2026, 9, 19, 9, 55)
+    assert leave_text("da", leave_at, 50, 0, 15) == "Afgang: 09:55 (ca. 50 min. kørsel + 15 min. før tid)"
+    assert leave_text("en", leave_at, 50, 0, 15) == "Leave at 09:55 (about 50 min drive + 15 min early)"
+    assert leave_text("da", leave_at, 50, early_minutes=0) == "Afgang: 09:55 (ca. 50 min. kørsel)"
+    assert leave_text("en", leave_at, 50, early_minutes=0) == "Leave at 09:55 (about 50 min drive)"
+    evening = datetime(2026, 9, 19, 23, 45)
+    assert leave_text("da-DK", evening, 30, 1, 5) == "Afgang: 23:45 dagen før (ca. 30 min. kørsel + 5 min. før tid)"
+    assert leave_text("en", evening, 30, 1, 5) == "Leave at 23:45 the day before (about 30 min drive + 5 min early)"
+
+
 @pytest.mark.parametrize(
     ("location", "coordinates", "expected"),
     [

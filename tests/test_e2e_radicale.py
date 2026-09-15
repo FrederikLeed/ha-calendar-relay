@@ -9,12 +9,13 @@ from __future__ import annotations
 import base64
 import re
 import xml.etree.ElementTree as ET
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 import pytest
+import vobject
 from homeassistant.components.calendar import DATA_COMPONENT
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME
@@ -38,6 +39,7 @@ from custom_components.calendar_relay.const import (
     DOMAIN,
     SUBENTRY_TYPE_RELAY,
 )
+from custom_components.calendar_relay.ics import render_event, vtimezone_lines
 
 from .conftest import CALL_UP, PREFIX, FakeWaze
 
@@ -57,9 +59,27 @@ PROPFIND_ETAG = (
 MAP_LINK = "Kort: https://maps.apple.com/?ll=55.123456,10.654321&q=Example%20Stadium"
 
 
-def utc_stamp(value: Any) -> str:
-    """Format a datetime like a UTC DATE-TIME."""
-    return dt_util.as_utc(value).strftime("%Y%m%dT%H%M%SZ")
+def local_stamp(value: Any) -> str:
+    """Format a datetime like a local DATE-TIME in Home Assistant's time zone."""
+    return dt_util.as_local(value).strftime("%Y%m%dT%H%M%S")
+
+
+def observances(body: str) -> tuple[str, list[list[str]]]:
+    """Return the TZID of the one VTIMEZONE in an event and its observances, each as sorted lines, sorted.
+
+    Radicale writes the observances grouped by kind and their properties in its own order.
+    """
+    lines = body.splitlines()
+    assert lines.count("BEGIN:VTIMEZONE") == 1
+    block = lines[lines.index("BEGIN:VTIMEZONE") + 1 : lines.index("END:VTIMEZONE")]
+    tzid = next(line for line in block if line.startswith("TZID:"))
+    found: list[list[str]] = []
+    for line in block:
+        if line in ("BEGIN:STANDARD", "BEGIN:DAYLIGHT"):
+            found.append([line])
+        elif found and not found[-1][-1].startswith("END:"):
+            found[-1].append(line)
+    return tzid, sorted(sorted(observance) for observance in found)
 
 
 async def server_events(hass: HomeAssistant, calendar_url: str) -> dict[str, str]:
@@ -225,10 +245,18 @@ async def test_relay_local_calendar_into_radicale(
     match_body = created[match_name]
     match_lines = match_body.splitlines()
     assert f"UID:{match_name.removeprefix('relay-').removesuffix('.ics')}@calendar-relay" in match_body
-    assert f"DTSTART:{utc_stamp(kickoff)}" in match_body
-    assert f"DTEND:{utc_stamp(kickoff + timedelta(hours=2))}" in match_body
+    # Times round-trip as local times in the home time zone, with the VTIMEZONE the relay wrote.
+    assert f"DTSTART;TZID=Europe/Copenhagen:{local_stamp(kickoff)}" in match_lines
+    assert f"DTEND;TZID=Europe/Copenhagen:{local_stamp(kickoff + timedelta(hours=2))}" in match_lines
+    written = vtimezone_lines("Europe/Copenhagen", kickoff.year)
+    assert observances(match_body) == observances("\n".join(written))
+    assert observances(match_body)[0] == "TZID:Europe/Copenhagen"
+    parsed = vobject.readOne(match_body).vevent
+    assert parsed.dtstart.value == kickoff
+    assert parsed.dtend.value == kickoff + timedelta(hours=2)
+    assert parsed.dtstart.value.utcoffset() == kickoff.utcoffset()
     assert (
-        "DESCRIPTION:Leave at 09:30 (about 25 min drive)\\nMeet at 9:30\\; bring water\\, shin pads\\n"
+        "DESCRIPTION:Leave at 09:30 (about 25 min drive + 5 min early)\\nMeet at 9:30\\; bring water\\, shin pads\\n"
         "Kort: https://maps.apple.com/?ll=55.123456\\,10.654321&q=Example%20Stadium"
     ) in match_lines
     assert "LOCATION:Example Stadium\\nExample Road 1\\, 1234 Sampletown" in match_lines
@@ -241,7 +269,7 @@ async def test_relay_local_calendar_into_radicale(
     cup_body = next(body for body in created.values() if "Cup day" in body)
     assert f"DTSTART;VALUE=DATE:{cup_day.strftime('%Y%m%d')}" in cup_body
     assert f"DTEND;VALUE=DATE:{(cup_day + timedelta(days=1)).strftime('%Y%m%d')}" in cup_body
-    for word in ("X-APPLE", "VALARM", "Leave at"):
+    for word in ("X-APPLE", "VALARM", "Leave at", "VTIMEZONE", "TZID"):
         assert word not in cup_body
 
     # Update in place: the match is rescheduled; the leave time follows without asking Waze again.
@@ -255,9 +283,10 @@ async def test_relay_local_calendar_into_radicale(
 
     updated = await server_events(hass, family_url)
     assert set(updated) == set(created)
-    assert f"DTSTART:{utc_stamp(new_kickoff)}" in updated[match_name]
-    assert f"DTSTART:{utc_stamp(kickoff)}" not in updated[match_name]
-    assert "Leave at 12:30 (about 25 min drive)" in updated[match_name]
+    assert f"DTSTART;TZID=Europe/Copenhagen:{local_stamp(new_kickoff)}" in updated[match_name]
+    assert f"DTSTART;TZID=Europe/Copenhagen:{local_stamp(kickoff)}" not in updated[match_name]
+    assert vobject.readOne(updated[match_name]).vevent.dtstart.value == new_kickoff
+    assert "Leave at 12:30 (about 25 min drive + 5 min early)" in updated[match_name]
     assert len(waze.calls) == 1
 
     # Delete: the call-up is withdrawn, so the title loses the prefix.
@@ -285,3 +314,76 @@ PLACE_ON_RADICALE = (
     'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS="Example Road 1, 1234 Sampletown";X-APPLE-RADIUS=71;'
     "X-TITLE=Example Stadium:geo:55.123456"
 )
+TIME_RANGE_QUERY = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/></d:prop>'
+    '<c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">'
+    '<c:time-range start="{start}" end="{end}"/>'
+    "</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"
+)
+
+
+async def events_between(hass: HomeAssistant, calendar_url: str, start: datetime, end: datetime) -> list[str]:
+    """Return the resource names a calendar-query finds in a UTC time range, the way the server reads the events."""
+    session = async_get_clientsession(hass)
+    stamp = "%Y%m%dT%H%M%SZ"
+    async with session.request(
+        "REPORT",
+        calendar_url,
+        headers={**AUTH, "Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        data=TIME_RANGE_QUERY.format(start=start.strftime(stamp), end=end.strftime(stamp)),
+    ) as response:
+        assert response.status == 207
+        body = await response.read()
+    return sorted(
+        element.text.rsplit("/", 1)[-1]
+        for element in ET.fromstring(body).iter("{DAV:}href")
+        if element.text and element.text.endswith(".ics")
+    )
+
+
+@pytest.mark.parametrize(
+    ("time_zone", "first", "second"),
+    [
+        # Summer events a year apart.
+        ("Europe/Copenhagen", datetime(2026, 6, 5, 8, 0, tzinfo=UTC), datetime(2027, 6, 5, 8, 0, tzinfo=UTC)),
+        # South of the equator: a summer event, then a winter event the year after.
+        ("Australia/Sydney", datetime(2026, 1, 10, 0, 0, tzinfo=UTC), datetime(2027, 6, 10, 1, 0, tzinfo=UTC)),
+    ],
+)
+async def test_events_in_different_years_read_right_in_one_radicale_process(
+    hass: HomeAssistant, radicale_url: str, time_zone: str, first: datetime, second: datetime
+) -> None:
+    """Radicale's parser, vobject, reads every object with the first VTIMEZONE it read for a TZID.
+
+    Two relayed events in different years are stored on one server. A time-range query inside each finds
+    it, and queries in the hour before and after it do not. vobject, which Home Assistant's CalDAV
+    integration also uses, reads both as the moments they were in this same process.
+    """
+    session = async_get_clientsession(hass)
+    calendar_url = f"{radicale_url}/emma/family/"
+    async with session.request(
+        "MKCALENDAR", calendar_url, headers=AUTH, data=MKCALENDAR.format(name="Family", component="VEVENT")
+    ) as response:
+        assert response.status == 201
+    events = {"first.ics": first, "second.ics": second}
+    bodies: dict[str, str] = {}
+    for name, start in events.items():
+        bodies[name] = render_event(
+            uid=name, summary="Match", start=start, end=start + timedelta(hours=1), dtstamp=start, time_zone=time_zone
+        )
+        async with session.put(
+            urljoin(calendar_url, name),
+            headers={**AUTH, "Content-Type": "text/calendar; charset=utf-8"},
+            data=bodies[name].encode(),
+        ) as response:
+            assert response.status == 201
+
+    for name, start in events.items():
+        minutes = timedelta(minutes=1)
+        assert await events_between(hass, calendar_url, start + 15 * minutes, start + 45 * minutes) == [name]
+        assert await events_between(hass, calendar_url, start - 45 * minutes, start - 15 * minutes) == []
+        assert await events_between(hass, calendar_url, start + 75 * minutes, start + 105 * minutes) == []
+        parsed = vobject.readOne(bodies[name]).vevent
+        assert parsed.dtstart.value.timestamp() == start.timestamp()
+        assert parsed.dtend.value.timestamp() == (start + timedelta(hours=1)).timestamp()

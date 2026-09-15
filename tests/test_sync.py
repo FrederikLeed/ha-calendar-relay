@@ -97,12 +97,17 @@ async def test_first_sync_relays_matching_events(
         assert "DTSTAMP:20260915T100000Z\r\n" in body
     match_body = next(body for body in fake_dav.resources.values() if "Home - Away" in body)
     assert "SUMMARY:⚽ Emma: Home - Away\r\n" in match_body
-    assert "DTSTART:20260920T100000Z\r\nDTEND:20260920T120000Z\r\n" in match_body
+    assert (
+        "DTSTART;TZID=Europe/Copenhagen:20260920T120000\r\nDTEND;TZID=Europe/Copenhagen:20260920T140000\r\n"
+        in match_body
+    )
+    assert match_body.count("BEGIN:VTIMEZONE\r\nTZID:Europe/Copenhagen\r\n") == 1
     assert "DESCRIPTION:Meet at 9:30\\; bring water\r\n" in match_body
     assert "LOCATION:Pitch 2\r\n" in match_body
     cup_body = next(body for body in fake_dav.resources.values() if "Cup day" in body)
     assert "SUMMARY:⚽ Emma: Cup day\r\n" in cup_body
     assert "DTSTART;VALUE=DATE:20260926\r\nDTEND;VALUE=DATE:20260927\r\n" in cup_body
+    assert "VTIMEZONE" not in cup_body
 
     records = stored(hass_storage)
     assert len(records) == 2
@@ -144,7 +149,7 @@ async def test_rescheduled_event_is_updated_in_place(
     await relay_of(config_entry).async_sync()
 
     assert fake_dav.calls == [("PUT", href)]
-    assert "DTSTART:20260920T130000Z\r\n" in fake_dav.resources[href]
+    assert "DTSTART;TZID=Europe/Copenhagen:20260920T150000\r\n" in fake_dav.resources[href]
     record = next(iter(stored(hass_storage).values()))
     assert record["hash"] != old_hash
     assert record["start"] == "2026-09-20T13:00:00+00:00"
@@ -360,7 +365,8 @@ async def test_recurring_instances_are_separate_events(
     await setup_entry(hass, config_entry)
     hrefs = fake_dav.puts()
     assert len(set(hrefs)) == 3
-    assert all("RRULE" not in body for body in fake_dav.resources.values())
+    # The VTIMEZONE has yearly RRULEs; the events themselves repeat nothing.
+    assert all("RRULE" not in body[body.index("BEGIN:VEVENT") :] for body in fake_dav.resources.values())
 
     source_calendar.events = [instances[0], instances[2]]
     fake_dav.calls.clear()
