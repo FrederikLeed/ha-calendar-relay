@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,15 +15,24 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.calendar_relay.caldav import CalDavConnectionError, DavCalendar
+from custom_components.calendar_relay.config_flow import _relay_schema
 from custom_components.calendar_relay.const import (
+    CONF_BUFFER_MINUTES,
+    CONF_LEAVE_REMINDER,
     CONF_LOOK_AHEAD_DAYS,
     CONF_REMOVE_FILTER,
     CONF_SOURCE,
+    CONF_STRUCTURED_LOCATION,
     CONF_TARGET,
     CONF_TARGET_NAME,
     CONF_TITLE_FILTER,
     CONF_TITLE_PREFIX,
+    CONF_TRAVEL_MINUTES,
+    CONF_TRAVEL_TIME,
+    CONF_WAZE_REGION,
     SUBENTRY_TYPE_RELAY,
+    TRAVEL_MODES,
+    WAZE_REGIONS,
 )
 
 from .conftest import (
@@ -36,6 +47,7 @@ from .conftest import (
     WORK_URL,
     FakeCalendar,
     FakeDav,
+    FakeWaze,
     make_entry,
     relay_data,
     relay_subentry,
@@ -44,6 +56,24 @@ from .conftest import (
 )
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
+
+INTEGRATION_DIR = Path(__file__).parent.parent / "custom_components" / "calendar_relay"
+OLD_KEYS = (
+    CONF_SOURCE,
+    CONF_TARGET,
+    CONF_TARGET_NAME,
+    CONF_TITLE_FILTER,
+    CONF_REMOVE_FILTER,
+    CONF_TITLE_PREFIX,
+    CONF_LOOK_AHEAD_DAYS,
+)
+KIDS_TO_FAMILY = {
+    CONF_SOURCE: SOURCE,
+    CONF_TARGET: FAMILY_URL,
+    CONF_TITLE_FILTER: CALL_UP,
+    CONF_REMOVE_FILTER: True,
+    CONF_TITLE_PREFIX: PREFIX,
+}
 
 
 def schema_key(result: dict[str, Any], name: str) -> Any:
@@ -235,3 +265,155 @@ async def test_reconfigure_keeps_a_target_that_disappeared(
     )
     assert result["type"] is FlowResultType.ABORT
     assert entry.subentries[RELAY_ID].data[CONF_TARGET_NAME] == "Old camp"
+
+
+async def test_add_relay_with_location_and_travel_settings(
+    hass: HomeAssistant, fake_dav: FakeDav, waze: FakeWaze
+) -> None:
+    """The new fields have defaults, translated options, and are stored as given."""
+    entry = make_entry()
+    await setup_entry(hass, entry)
+    result = await start_add(hass, entry)
+    defaults = {
+        CONF_STRUCTURED_LOCATION: True,
+        CONF_TRAVEL_TIME: "off",
+        CONF_TRAVEL_MINUTES: 15,
+        CONF_WAZE_REGION: "eu",
+        CONF_BUFFER_MINUTES: 0,
+        CONF_LEAVE_REMINDER: False,
+    }
+    assert {name: schema_key(result, name).default() for name in defaults} == defaults
+    schema = result["data_schema"].schema
+    assert schema[schema_key(result, CONF_TRAVEL_TIME)].config["options"] == ["off", "fixed", "waze"]
+    assert schema[schema_key(result, CONF_TRAVEL_TIME)].config["translation_key"] == "travel_time"
+    assert schema[schema_key(result, CONF_WAZE_REGION)].config["options"] == ["us", "na", "eu", "il", "au"]
+    assert schema[schema_key(result, CONF_WAZE_REGION)].config["translation_key"] == "waze_region"
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            **KIDS_TO_FAMILY,
+            CONF_STRUCTURED_LOCATION: False,
+            CONF_TRAVEL_TIME: "waze",
+            CONF_TRAVEL_MINUTES: 30,
+            CONF_WAZE_REGION: "na",
+            CONF_BUFFER_MINUTES: 5,
+            CONF_LEAVE_REMINDER: True,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == relay_data(
+        structured_location=False,
+        travel_time="waze",
+        travel_minutes=30,
+        waze_region="na",
+        buffer_minutes=5,
+        leave_reminder=True,
+    )
+    assert isinstance(result["data"][CONF_TRAVEL_MINUTES], int)
+    assert isinstance(result["data"][CONF_BUFFER_MINUTES], int)
+
+
+async def test_waze_needs_its_action(hass: HomeAssistant, fake_dav: FakeDav) -> None:
+    """Choosing Waze without the action shows an error and keeps what was entered."""
+    entry = make_entry()
+    await setup_entry(hass, entry)
+    result = await start_add(hass, entry)
+    user_input = {**KIDS_TO_FAMILY, CONF_TRAVEL_TIME: "waze", CONF_BUFFER_MINUTES: 10}
+
+    result = await hass.config_entries.subentries.async_configure(result["flow_id"], user_input)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+    assert result["errors"] == {CONF_TRAVEL_TIME: "waze_unavailable"}
+    assert schema_key(result, CONF_TRAVEL_TIME).description == {"suggested_value": "waze"}
+    assert schema_key(result, CONF_BUFFER_MINUTES).description == {"suggested_value": 10}
+    assert entry.subentries == {}
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {**user_input, CONF_TRAVEL_TIME: "fixed"}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == relay_data(travel_time="fixed", buffer_minutes=10)
+
+
+async def test_reconfigure_travel_settings(
+    hass: HomeAssistant, source_calendar: FakeCalendar, fake_dav: FakeDav, config_entry: MockConfigEntry
+) -> None:
+    """Reconfigure prefills the new fields, refuses Waze until its action exists, then applies the change."""
+    await setup_entry(hass, config_entry)
+    result = await config_entry.start_subentry_reconfigure_flow(hass, RELAY_ID)
+    assert schema_key(result, CONF_STRUCTURED_LOCATION).description == {"suggested_value": True}
+    assert schema_key(result, CONF_TRAVEL_TIME).description == {"suggested_value": "off"}
+    assert schema_key(result, CONF_LEAVE_REMINDER).description == {"suggested_value": False}
+
+    user_input = {**KIDS_TO_FAMILY, CONF_TRAVEL_TIME: "waze", CONF_WAZE_REGION: "au", CONF_LEAVE_REMINDER: True}
+    result = await hass.config_entries.subentries.async_configure(result["flow_id"], user_input)
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_TRAVEL_TIME: "waze_unavailable"}
+
+    FakeWaze().register(hass)
+    result = await hass.config_entries.subentries.async_configure(result["flow_id"], user_input)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert dict(config_entry.subentries[RELAY_ID].data) == relay_data(
+        travel_time="waze", waze_region="au", leave_reminder=True
+    )
+    config = config_entry.runtime_data.relays[RELAY_ID].config
+    assert (config.travel_time, config.waze_region, config.leave_reminder) == ("waze", "au", True)
+
+
+async def test_reconfigure_a_relay_saved_before_the_travel_settings(
+    hass: HomeAssistant, source_calendar: FakeCalendar, fake_dav: FakeDav
+) -> None:
+    """A relay stored without the new keys shows their defaults and gets them written on save."""
+    entry = make_entry({**relay_subentry(), "data": {name: relay_data()[name] for name in OLD_KEYS}})
+    await setup_entry(hass, entry)
+
+    result = await entry.start_subentry_reconfigure_flow(hass, RELAY_ID)
+    assert schema_key(result, CONF_TRAVEL_TIME).description is None
+    assert schema_key(result, CONF_TRAVEL_TIME).default() == "off"
+    assert schema_key(result, CONF_TITLE_PREFIX).description == {"suggested_value": PREFIX}
+
+    result = await hass.config_entries.subentries.async_configure(result["flow_id"], dict(KIDS_TO_FAMILY))
+    assert result["type"] is FlowResultType.ABORT
+    assert dict(entry.subentries[RELAY_ID].data) == relay_data()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (CONF_TRAVEL_MINUTES, 0),
+        (CONF_TRAVEL_MINUTES, 481),
+        (CONF_BUFFER_MINUTES, -1),
+        (CONF_BUFFER_MINUTES, 121),
+        (CONF_TRAVEL_TIME, "walk"),
+        (CONF_WAZE_REGION, "xx"),
+    ],
+)
+async def test_travel_settings_are_limited(hass: HomeAssistant, fake_dav: FakeDav, field: str, value: Any) -> None:
+    """Travel minutes are 1 to 480, the buffer 0 to 120, and only known modes and regions are accepted."""
+    entry = make_entry()
+    await setup_entry(hass, entry)
+    result = await start_add(hass, entry)
+    with pytest.raises(InvalidData):
+        await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {CONF_SOURCE: SOURCE, CONF_TARGET: FAMILY_URL, field: value}
+        )
+
+
+def test_translations_cover_the_relay_form() -> None:
+    """strings.json is en.json; both languages label and describe every field, the error and every option."""
+    english = (INTEGRATION_DIR / "translations" / "en.json").read_bytes()
+    assert (INTEGRATION_DIR / "strings.json").read_bytes() == english
+    fields = {str(key) for key in _relay_schema([]).schema}
+    for language in ("en", "da"):
+        strings = json.loads((INTEGRATION_DIR / "translations" / f"{language}.json").read_text(encoding="utf-8"))
+        relay = strings["config_subentries"]["relay"]
+        for step in ("user", "reconfigure"):
+            assert set(relay["step"][step]["data"]) == fields
+            assert set(relay["step"][step]["data_description"]) == fields
+        assert set(relay["error"]) == {"waze_unavailable"}
+        assert set(strings["selector"]["travel_time"]["options"]) == set(TRAVEL_MODES)
+        assert set(strings["selector"]["waze_region"]["options"]) == set(WAZE_REGIONS)

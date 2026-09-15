@@ -14,24 +14,33 @@ from unittest.mock import patch
 import pytest
 import radicale.config
 import radicale.server
+import voluptuous as vol
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
 from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry, setup_test_component_platform
 
 from custom_components.calendar_relay.caldav import DavCalendar, is_event_href
 from custom_components.calendar_relay.const import (
+    CONF_BUFFER_MINUTES,
+    CONF_LEAVE_REMINDER,
     CONF_LOOK_AHEAD_DAYS,
     CONF_REMOVE_FILTER,
     CONF_SOURCE,
+    CONF_STRUCTURED_LOCATION,
     CONF_TARGET,
     CONF_TARGET_NAME,
     CONF_TITLE_FILTER,
     CONF_TITLE_PREFIX,
+    CONF_TRAVEL_MINUTES,
+    CONF_TRAVEL_TIME,
+    CONF_WAZE_REGION,
     DOMAIN,
     SUBENTRY_TYPE_RELAY,
+    WAZE_DOMAIN,
+    WAZE_SERVICE,
 )
 
 ACCOUNT_URL = "https://caldav.example.com/"
@@ -138,6 +147,13 @@ class FakeDav:
         return [href for method, href in self.calls if method == "DELETE"]
 
 
+@pytest.fixture(autouse=True)
+def _no_waze_pause() -> Generator[None]:
+    """Skip the half second between Waze calls, so tests with many calls stay fast."""
+    with patch("custom_components.calendar_relay.relay.WAZE_CALL_PAUSE", 0):
+        yield
+
+
 @pytest.fixture
 def fake_dav() -> Generator[FakeDav]:
     """Replace the CalDAV client everywhere the integration creates one."""
@@ -167,9 +183,77 @@ def relay_data(**overrides: Any) -> dict[str, Any]:
         CONF_REMOVE_FILTER: True,
         CONF_TITLE_PREFIX: PREFIX,
         CONF_LOOK_AHEAD_DAYS: 60,
+        CONF_STRUCTURED_LOCATION: True,
+        CONF_TRAVEL_TIME: "off",
+        CONF_TRAVEL_MINUTES: 15,
+        CONF_WAZE_REGION: "eu",
+        CONF_BUFFER_MINUTES: 0,
+        CONF_LEAVE_REMINDER: False,
     }
     data.update(overrides)
     return data
+
+
+class FakeWaze:
+    """Stand-in for the waze_travel_time.get_travel_times action (pywaze is not installed in the test venv).
+
+    The schema has the keys of the action in Home Assistant 2026.3, the oldest supported
+    version, and rejects others, like the real one.
+    """
+
+    SCHEMA = vol.Schema(
+        {
+            vol.Required("origin"): str,
+            vol.Required("destination"): str,
+            vol.Required("region"): vol.In(["us", "na", "eu", "il", "au"]),
+            vol.Optional("realtime", default=False): bool,
+            vol.Optional("vehicle_type", default="car"): vol.In(["car", "taxi", "motorcycle"]),
+            vol.Optional("units", default="metric"): vol.In(["metric", "imperial"]),
+            vol.Optional("avoid_toll_roads", default=False): bool,
+            vol.Optional("avoid_subscription_roads", default=False): bool,
+            vol.Optional("avoid_ferries", default=False): bool,
+            vol.Optional("incl_filter"): [str],
+            vol.Optional("excl_filter"): [str],
+        }
+    )
+
+    def __init__(self) -> None:
+        """Answer 23.4 minutes for every destination until a test says otherwise."""
+        self.calls: list[dict[str, Any]] = []
+        self.duration: float = 23.4
+        self.durations: dict[str, float] = {}
+        self.response: Any = None
+        self.error: Exception | None = None
+        # Errors for single destinations, as when Waze cannot find a place.
+        self.errors: dict[str, Exception] = {}
+
+    def register(self, hass: HomeAssistant) -> None:
+        """Register the action."""
+        hass.services.async_register(
+            WAZE_DOMAIN, WAZE_SERVICE, self._async_handle, schema=self.SCHEMA, supports_response=SupportsResponse.ONLY
+        )
+
+    async def _async_handle(self, call: ServiceCall) -> ServiceResponse:
+        self.calls.append(dict(call.data))
+        error = self.errors.get(call.data["destination"], self.error)
+        if error is not None:
+            raise error
+        if self.response is not None:
+            return self.response
+        duration = self.durations.get(call.data["destination"], self.duration)
+        return {"routes": [{"duration": duration, "distance": 18.2, "name": "Example Road", "street_names": []}]}
+
+    def realtime_flags(self) -> list[bool]:
+        """Return the realtime flag of every call in order."""
+        return [call["realtime"] for call in self.calls]
+
+
+@pytest.fixture
+def waze(hass: HomeAssistant) -> FakeWaze:
+    """Provide waze_travel_time.get_travel_times with invented answers."""
+    fake = FakeWaze()
+    fake.register(hass)
+    return fake
 
 
 def relay_subentry(subentry_id: str = RELAY_ID, title: str = "Kids → Family", **overrides: Any) -> dict[str, Any]:

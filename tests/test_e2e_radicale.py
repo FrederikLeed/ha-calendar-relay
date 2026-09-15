@@ -1,4 +1,8 @@
-"""End to end: the core local_calendar integration, Calendar Relay and a real Radicale CalDAV server."""
+"""End to end: the core local_calendar integration, Calendar Relay and a real Radicale CalDAV server.
+
+Places, coordinates and the home location are invented. Waze Travel Time is a fake action,
+because pywaze is not installed in the test environment and the live service is off limits.
+"""
 
 from __future__ import annotations
 
@@ -23,16 +27,19 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 
 from custom_components.calendar_relay.const import (
+    CONF_BUFFER_MINUTES,
+    CONF_LEAVE_REMINDER,
     CONF_REMOVE_FILTER,
     CONF_SOURCE,
     CONF_TARGET,
     CONF_TITLE_FILTER,
     CONF_TITLE_PREFIX,
+    CONF_TRAVEL_TIME,
     DOMAIN,
     SUBENTRY_TYPE_RELAY,
 )
 
-from .conftest import CALL_UP, PREFIX
+from .conftest import CALL_UP, PREFIX, FakeWaze
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
 
@@ -47,6 +54,7 @@ MKCALENDAR = (
 PROPFIND_ETAG = (
     '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>'
 )
+MAP_LINK = "Kort: https://maps.apple.com/?ll=55.123456,10.654321&q=Example%20Stadium"
 
 
 def utc_stamp(value: Any) -> str:
@@ -87,11 +95,15 @@ def summaries(events: dict[str, str]) -> list[str]:
 async def test_relay_local_calendar_into_radicale(
     hass: HomeAssistant, hass_ws_client: WebSocketGenerator, radicale_url: str, tmp_path: Path
 ) -> None:
-    """Create, update in place and delete, as seen on the CalDAV server."""
+    """Create, update in place and delete, as seen on the CalDAV server, with place details and travel time."""
     await hass.config.async_set_time_zone("Europe/Copenhagen")
+    hass.config.latitude = 55.0
+    hass.config.longitude = 11.0
     config_dir = tmp_path / "config"
     (config_dir / ".storage").mkdir(parents=True)
     hass.config.config_dir = str(config_dir)
+    waze = FakeWaze()
+    waze.register(hass)
 
     session = async_get_clientsession(hass)
     for name, component in (("family", "VEVENT"), ("tasks", "VTODO")):
@@ -123,8 +135,8 @@ async def test_relay_local_calendar_into_radicale(
         "summary": f"{CALL_UP}Home - Away",
         "dtstart": kickoff.isoformat(),
         "dtend": (kickoff + timedelta(hours=2)).isoformat(),
-        "description": "Meet at 9:30; bring water, shin pads",
-        "location": "Pitch 2",
+        "description": f"Meet at 9:30; bring water, shin pads\n{MAP_LINK}",
+        "location": "Example Stadium\nExample Road 1, 1234 Sampletown",
     }
     await calendar_command("create", {"event": match})
     await calendar_command(
@@ -144,6 +156,7 @@ async def test_relay_local_calendar_into_radicale(
                 "summary": f"{CALL_UP}Cup day",
                 "dtstart": cup_day.isoformat(),
                 "dtend": (cup_day + timedelta(days=1)).isoformat(),
+                "location": "Example Arena",
             }
         },
     )
@@ -173,7 +186,7 @@ async def test_relay_local_calendar_into_radicale(
         f"{radicale_url}/emma/tasks/": False,
     }
 
-    # The relay: only the event calendar is offered.
+    # The relay: only the event calendar is offered; travel time comes from Waze, with a buffer and a reminder.
     result = await hass.config_entries.subentries.async_init(
         (entry.entry_id, SUBENTRY_TYPE_RELAY), context={"source": SOURCE_USER}
     )
@@ -187,6 +200,9 @@ async def test_relay_local_calendar_into_radicale(
             CONF_TITLE_FILTER: CALL_UP,
             CONF_REMOVE_FILTER: True,
             CONF_TITLE_PREFIX: PREFIX,
+            CONF_TRAVEL_TIME: "waze",
+            CONF_BUFFER_MINUTES: 5,
+            CONF_LEAVE_REMINDER: True,
         },
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
@@ -207,16 +223,28 @@ async def test_relay_local_calendar_into_radicale(
     assert all(re.fullmatch(r"relay-[0-9a-f]{32}\.ics", name) for name in created)
     match_name = next(name for name, body in created.items() if "Home - Away" in body)
     match_body = created[match_name]
+    match_lines = match_body.splitlines()
     assert f"UID:{match_name.removeprefix('relay-').removesuffix('.ics')}@calendar-relay" in match_body
     assert f"DTSTART:{utc_stamp(kickoff)}" in match_body
     assert f"DTEND:{utc_stamp(kickoff + timedelta(hours=2))}" in match_body
-    assert "Meet at 9:30\\; bring water\\, shin pads" in match_body
-    assert "LOCATION:Pitch 2" in match_body
+    assert (
+        "DESCRIPTION:Leave at 09:30 (about 25 min drive)\\nMeet at 9:30\\; bring water\\, shin pads\\n"
+        "Kort: https://maps.apple.com/?ll=55.123456\\,10.654321&q=Example%20Stadium"
+    ) in match_lines
+    assert "LOCATION:Example Stadium\\nExample Road 1\\, 1234 Sampletown" in match_lines
+    assert "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT30M" in match_lines
+    alarm = match_lines[match_lines.index("BEGIN:VALARM") : match_lines.index("END:VALARM") + 1]
+    assert sorted(alarm[1:-1]) == ["ACTION:DISPLAY", f"DESCRIPTION:{PREFIX}Home - Away", "TRIGGER:-PT30M"]
+    [place] = [line for line in match_lines if line.startswith("X-APPLE-STRUCTURED-LOCATION;")]
+    assert place == PLACE_ON_RADICALE
+    assert [(call["destination"], call["realtime"]) for call in waze.calls] == [("55.123456,10.654321", False)]
     cup_body = next(body for body in created.values() if "Cup day" in body)
     assert f"DTSTART;VALUE=DATE:{cup_day.strftime('%Y%m%d')}" in cup_body
     assert f"DTEND;VALUE=DATE:{(cup_day + timedelta(days=1)).strftime('%Y%m%d')}" in cup_body
+    for word in ("X-APPLE", "VALARM", "Leave at"):
+        assert word not in cup_body
 
-    # Update in place: the match is rescheduled.
+    # Update in place: the match is rescheduled; the leave time follows without asking Waze again.
     source = hass.data[DATA_COMPONENT].get_entity("calendar.kids")
     source_events = await source.async_get_events(hass, dt_util.now(), dt_util.now() + timedelta(days=30))
     match_uid = next(event.uid for event in source_events if event.summary == match["summary"])
@@ -229,6 +257,8 @@ async def test_relay_local_calendar_into_radicale(
     assert set(updated) == set(created)
     assert f"DTSTART:{utc_stamp(new_kickoff)}" in updated[match_name]
     assert f"DTSTART:{utc_stamp(kickoff)}" not in updated[match_name]
+    assert "Leave at 12:30 (about 25 min drive)" in updated[match_name]
+    assert len(waze.calls) == 1
 
     # Delete: the call-up is withdrawn, so the title loses the prefix.
     await calendar_command("update", {"uid": match_uid, "event": {**rescheduled, "summary": "Home - Away"}})
@@ -245,3 +275,13 @@ async def test_relay_local_calendar_into_radicale(
     assert hass.config_entries.async_remove_subentry(entry, subentry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
     assert set(await server_events(hass, family_url)) == set(remaining)
+
+
+# What the relay writes is X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS="Example Road 1, 1234 Sampletown";
+# X-APPLE-RADIUS=71;X-TITLE="Example Stadium":geo:55.123456,10.654321 (see test_ics and test_travel).
+# Radicale parses unknown properties with vobject, which reads the value as TEXT and keeps only the part before
+# the first unescaped comma, and writes parameters without quotes where none are needed.
+PLACE_ON_RADICALE = (
+    'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS="Example Road 1, 1234 Sampletown";X-APPLE-RADIUS=71;'
+    "X-TITLE=Example Stadium:geo:55.123456"
+)

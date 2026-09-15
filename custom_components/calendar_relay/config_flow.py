@@ -38,20 +38,38 @@ from . import CalendarRelayConfigEntry, create_client
 from .caldav import CalDavAuthError, CalDavError, DavCalendar
 from .const import (
     APP_PASSWORD_URL,
+    CONF_BUFFER_MINUTES,
+    CONF_LEAVE_REMINDER,
     CONF_LOOK_AHEAD_DAYS,
     CONF_REMOVE_FILTER,
     CONF_SOURCE,
+    CONF_STRUCTURED_LOCATION,
     CONF_TARGET,
     CONF_TARGET_NAME,
     CONF_TITLE_FILTER,
     CONF_TITLE_PREFIX,
+    CONF_TRAVEL_MINUTES,
+    CONF_TRAVEL_TIME,
+    CONF_WAZE_REGION,
+    DEFAULT_BUFFER_MINUTES,
     DEFAULT_LOOK_AHEAD_DAYS,
+    DEFAULT_TRAVEL_MINUTES,
     DEFAULT_URL,
+    DEFAULT_WAZE_REGION,
     DOMAIN,
     LOGGER,
+    MAX_BUFFER_MINUTES,
     MAX_LOOK_AHEAD_DAYS,
+    MAX_TRAVEL_MINUTES,
     MIN_LOOK_AHEAD_DAYS,
+    MIN_TRAVEL_MINUTES,
     SUBENTRY_TYPE_RELAY,
+    TRAVEL_MODES,
+    TRAVEL_OFF,
+    TRAVEL_WAZE,
+    WAZE_DOMAIN,
+    WAZE_REGIONS,
+    WAZE_SERVICE,
 )
 
 _URL_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.URL))
@@ -251,6 +269,32 @@ def _relay_schema(options: list[SelectOptionDict]) -> vol.Schema:
                     min=MIN_LOOK_AHEAD_DAYS, max=MAX_LOOK_AHEAD_DAYS, step=1, mode=NumberSelectorMode.BOX
                 )
             ),
+            vol.Required(CONF_STRUCTURED_LOCATION, default=True): BooleanSelector(),
+            vol.Required(CONF_TRAVEL_TIME, default=TRAVEL_OFF): SelectSelector(
+                SelectSelectorConfig(
+                    options=list(TRAVEL_MODES), mode=SelectSelectorMode.DROPDOWN, translation_key=CONF_TRAVEL_TIME
+                )
+            ),
+            vol.Required(CONF_TRAVEL_MINUTES, default=DEFAULT_TRAVEL_MINUTES): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_TRAVEL_MINUTES,
+                    max=MAX_TRAVEL_MINUTES,
+                    step=1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="min",
+                )
+            ),
+            vol.Required(CONF_WAZE_REGION, default=DEFAULT_WAZE_REGION): SelectSelector(
+                SelectSelectorConfig(
+                    options=list(WAZE_REGIONS), mode=SelectSelectorMode.DROPDOWN, translation_key=CONF_WAZE_REGION
+                )
+            ),
+            vol.Required(CONF_BUFFER_MINUTES, default=DEFAULT_BUFFER_MINUTES): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=MAX_BUFFER_MINUTES, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
+                )
+            ),
+            vol.Required(CONF_LEAVE_REMINDER, default=False): BooleanSelector(),
         }
     )
 
@@ -278,6 +322,7 @@ class RelaySubentryFlow(ConfigSubentryFlow):
         if not calendars and not current:
             return self.async_abort(reason="no_calendars")
 
+        errors: dict[str, str] = {}
         if user_input is not None:
             names = {calendar.url: calendar.name for calendar in calendars}
             target = user_input[CONF_TARGET]
@@ -289,16 +334,29 @@ class RelaySubentryFlow(ConfigSubentryFlow):
                 CONF_REMOVE_FILTER: bool(user_input.get(CONF_REMOVE_FILTER, False)),
                 CONF_TITLE_PREFIX: user_input.get(CONF_TITLE_PREFIX, ""),
                 CONF_LOOK_AHEAD_DAYS: int(user_input.get(CONF_LOOK_AHEAD_DAYS, DEFAULT_LOOK_AHEAD_DAYS)),
+                CONF_STRUCTURED_LOCATION: bool(user_input.get(CONF_STRUCTURED_LOCATION, True)),
+                CONF_TRAVEL_TIME: user_input.get(CONF_TRAVEL_TIME, TRAVEL_OFF),
+                CONF_TRAVEL_MINUTES: int(user_input.get(CONF_TRAVEL_MINUTES, DEFAULT_TRAVEL_MINUTES)),
+                CONF_WAZE_REGION: user_input.get(CONF_WAZE_REGION, DEFAULT_WAZE_REGION),
+                CONF_BUFFER_MINUTES: int(user_input.get(CONF_BUFFER_MINUTES, DEFAULT_BUFFER_MINUTES)),
+                CONF_LEAVE_REMINDER: bool(user_input.get(CONF_LEAVE_REMINDER, False)),
             }
-            title = self._relay_title(data)
-            if step_id == "user":
-                return self.async_create_entry(title=title, data=data)
-            return self.async_update_and_abort(entry, self._get_reconfigure_subentry(), title=title, data=data)
+            # Before Home Assistant 2026.8 the action only exists while a Waze Travel Time entry is loaded.
+            if data[CONF_TRAVEL_TIME] == TRAVEL_WAZE and not self.hass.services.has_service(WAZE_DOMAIN, WAZE_SERVICE):
+                errors[CONF_TRAVEL_TIME] = "waze_unavailable"
+            else:
+                title = self._relay_title(data)
+                if step_id == "user":
+                    return self.async_create_entry(title=title, data=data)
+                return self.async_update_and_abort(entry, self._get_reconfigure_subentry(), title=title, data=data)
 
         schema = _relay_schema(_target_options(calendars, current.get(CONF_TARGET), current.get(CONF_TARGET_NAME)))
         return self.async_show_form(
             step_id=step_id,
-            data_schema=self.add_suggested_values_to_schema(schema, dict(current)),
+            data_schema=self.add_suggested_values_to_schema(
+                schema, user_input if user_input is not None else dict(current)
+            ),
+            errors=errors,
         )
 
     async def _async_calendars(self, entry: CalendarRelayConfigEntry) -> list[DavCalendar]:

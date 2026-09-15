@@ -61,7 +61,13 @@
             "title_filter": "Title filter",
             "remove_filter": "Remove filter text from title",
             "title_prefix": "Title prefix",
-            "look_ahead_days": "Look-ahead (days)"
+            "look_ahead_days": "Look-ahead (days)",
+            "structured_location": "Place details for Apple Calendar",
+            "travel_time": "Travel time",
+            "travel_minutes": "Fixed travel time",
+            "waze_region": "Waze region",
+            "buffer_minutes": "Extra buffer",
+            "leave_reminder": "Leave reminder"
           },
           "data_description": {
             "source_calendar": "The Home Assistant calendar to read.",
@@ -69,7 +75,13 @@
             "title_filter": "Only relay events whose title contains this text. Case does not matter. Leave empty to relay everything.",
             "remove_filter": "Remove the filter text, and separators such as a colon left in front, from the relayed title.",
             "title_prefix": "Text put in front of every relayed title, including any space you want after it.",
-            "look_ahead_days": "How many days ahead to relay, from 1 to 365."
+            "look_ahead_days": "How many days ahead to relay, from 1 to 365.",
+            "structured_location": "When the description or location has coordinates (a geo: link, or an Apple Maps, Google Maps or OpenStreetMap link), also write the exact place in Apple's format, so Apple Calendar shows a map and can tell when to leave. Other calendar apps ignore it.",
+            "travel_time": "Add a leave time to events that have a start time and a place: a fixed number of minutes, or the drive time Waze Travel Time finds from your Home Assistant home location.",
+            "travel_minutes": "Minutes of travel when travel time is set to fixed minutes, from 1 to 480.",
+            "waze_region": "The Waze server region, used when the travel time comes from Waze Travel Time.",
+            "buffer_minutes": "Minutes added to the travel time, for example for parking, from 0 to 120. The leave time is the start minus the travel time and this buffer.",
+            "leave_reminder": "Add an alert at the leave time. In a shared iCloud calendar it only rings on devices signed in to this account; other members turn on Time to Leave on their own iPhone."
           }
         },
         "reconfigure": {
@@ -81,7 +93,13 @@
             "title_filter": "Title filter",
             "remove_filter": "Remove filter text from title",
             "title_prefix": "Title prefix",
-            "look_ahead_days": "Look-ahead (days)"
+            "look_ahead_days": "Look-ahead (days)",
+            "structured_location": "Place details for Apple Calendar",
+            "travel_time": "Travel time",
+            "travel_minutes": "Fixed travel time",
+            "waze_region": "Waze region",
+            "buffer_minutes": "Extra buffer",
+            "leave_reminder": "Leave reminder"
           },
           "data_description": {
             "source_calendar": "The Home Assistant calendar to read.",
@@ -89,9 +107,18 @@
             "title_filter": "Only relay events whose title contains this text. Case does not matter. Leave empty to relay everything.",
             "remove_filter": "Remove the filter text, and separators such as a colon left in front, from the relayed title.",
             "title_prefix": "Text put in front of every relayed title, including any space you want after it.",
-            "look_ahead_days": "How many days ahead to relay, from 1 to 365."
+            "look_ahead_days": "How many days ahead to relay, from 1 to 365.",
+            "structured_location": "When the description or location has coordinates (a geo: link, or an Apple Maps, Google Maps or OpenStreetMap link), also write the exact place in Apple's format, so Apple Calendar shows a map and can tell when to leave. Other calendar apps ignore it.",
+            "travel_time": "Add a leave time to events that have a start time and a place: a fixed number of minutes, or the drive time Waze Travel Time finds from your Home Assistant home location.",
+            "travel_minutes": "Minutes of travel when travel time is set to fixed minutes, from 1 to 480.",
+            "waze_region": "The Waze server region, used when the travel time comes from Waze Travel Time.",
+            "buffer_minutes": "Minutes added to the travel time, for example for parking, from 0 to 120. The leave time is the start minus the travel time and this buffer.",
+            "leave_reminder": "Add an alert at the leave time. In a shared iCloud calendar it only rings on devices signed in to this account; other members turn on Time to Leave on their own iPhone."
           }
         }
+      },
+      "error": {
+        "waze_unavailable": "The Waze Travel Time action is not available. Add the Waze Travel Time integration first, or choose another travel time."
       },
       "abort": {
         "entry_not_loaded": "The account is not loaded. Fix the account first, then try again.",
@@ -124,6 +151,24 @@
     "target_calendar_missing": {
       "title": "Target calendar missing for {relay}",
       "description": "The relay {relay} could not write into the calendar {calendar}: the server says it does not exist, or it is not a calendar of this account (for example after the account was changed to another user). It may have been deleted or is no longer shared with this account. Reconfigure the relay to choose another target calendar, or restore the calendar. This message goes away after the next successful sync."
+    }
+  },
+  "selector": {
+    "travel_time": {
+      "options": {
+        "off": "Off",
+        "fixed": "Fixed minutes",
+        "waze": "Waze Travel Time"
+      }
+    },
+    "waze_region": {
+      "options": {
+        "us": "United States",
+        "na": "North America",
+        "eu": "Europe",
+        "il": "Israel",
+        "au": "Australia"
+      }
     }
   }
 }

@@ -61,7 +61,13 @@
             "title_filter": "Titelfilter",
             "remove_filter": "Fjern filterteksten fra titlen",
             "title_prefix": "Tekst foran titlen",
-            "look_ahead_days": "Dage frem"
+            "look_ahead_days": "Dage frem",
+            "structured_location": "Stedoplysninger til Apple Kalender",
+            "travel_time": "Rejsetid",
+            "travel_minutes": "Fast rejsetid",
+            "waze_region": "Waze-region",
+            "buffer_minutes": "Ekstra tid",
+            "leave_reminder": "Påmindelse om afgang"
           },
           "data_description": {
             "source_calendar": "Den kalender i Home Assistant, der skal læses.",
@@ -69,7 +75,13 @@
             "title_filter": "Send kun begivenheder videre, hvis titlen indeholder denne tekst. Store og små bogstaver er lige meget. Lad feltet stå tomt for at sende alt videre.",
             "remove_filter": "Fjern filterteksten og skilletegn som et kolon, der står tilbage foran, fra den videresendte titel.",
             "title_prefix": "Tekst, der sættes foran hver videresendt titel, med et mellemrum til sidst, hvis du vil have det.",
-            "look_ahead_days": "Hvor mange dage frem der sendes videre, fra 1 til 365."
+            "look_ahead_days": "Hvor mange dage frem der sendes videre, fra 1 til 365.",
+            "structured_location": "Når beskrivelsen eller stedet har koordinater (et geo:-link eller et link til Apple Kort, Google Maps eller OpenStreetMap), skrives det præcise sted også i Apples format, så Apple Kalender viser et kort og kan regne ud, hvornår du skal af sted. Andre kalenderapps ser bort fra det.",
+            "travel_time": "Tilføj et afgangstidspunkt til begivenheder med et klokkeslæt og et sted: et fast antal minutter eller den køretid, som Waze Travel Time finder fra dit hjem i Home Assistant.",
+            "travel_minutes": "Minutter på vejen, når rejsetiden er et fast antal minutter, fra 1 til 480.",
+            "waze_region": "Waze-serverens region, som bruges, når rejsetiden kommer fra Waze Travel Time.",
+            "buffer_minutes": "Minutter, der lægges oven i rejsetiden, for eksempel til parkering, fra 0 til 120. Afgang er starttidspunktet minus rejsetiden og den ekstra tid.",
+            "leave_reminder": "Tilføj en påmindelse ved afgang. I en delt iCloud-kalender ringer den kun på enheder, der er logget ind på denne konto. De andre slår Tid til at tage af sted til på deres egen iPhone."
           }
         },
         "reconfigure": {
@@ -81,7 +93,13 @@
             "title_filter": "Titelfilter",
             "remove_filter": "Fjern filterteksten fra titlen",
             "title_prefix": "Tekst foran titlen",
-            "look_ahead_days": "Dage frem"
+            "look_ahead_days": "Dage frem",
+            "structured_location": "Stedoplysninger til Apple Kalender",
+            "travel_time": "Rejsetid",
+            "travel_minutes": "Fast rejsetid",
+            "waze_region": "Waze-region",
+            "buffer_minutes": "Ekstra tid",
+            "leave_reminder": "Påmindelse om afgang"
           },
           "data_description": {
             "source_calendar": "Den kalender i Home Assistant, der skal læses.",
@@ -89,9 +107,18 @@
             "title_filter": "Send kun begivenheder videre, hvis titlen indeholder denne tekst. Store og små bogstaver er lige meget. Lad feltet stå tomt for at sende alt videre.",
             "remove_filter": "Fjern filterteksten og skilletegn som et kolon, der står tilbage foran, fra den videresendte titel.",
             "title_prefix": "Tekst, der sættes foran hver videresendt titel, med et mellemrum til sidst, hvis du vil have det.",
-            "look_ahead_days": "Hvor mange dage frem der sendes videre, fra 1 til 365."
+            "look_ahead_days": "Hvor mange dage frem der sendes videre, fra 1 til 365.",
+            "structured_location": "Når beskrivelsen eller stedet har koordinater (et geo:-link eller et link til Apple Kort, Google Maps eller OpenStreetMap), skrives det præcise sted også i Apples format, så Apple Kalender viser et kort og kan regne ud, hvornår du skal af sted. Andre kalenderapps ser bort fra det.",
+            "travel_time": "Tilføj et afgangstidspunkt til begivenheder med et klokkeslæt og et sted: et fast antal minutter eller den køretid, som Waze Travel Time finder fra dit hjem i Home Assistant.",
+            "travel_minutes": "Minutter på vejen, når rejsetiden er et fast antal minutter, fra 1 til 480.",
+            "waze_region": "Waze-serverens region, som bruges, når rejsetiden kommer fra Waze Travel Time.",
+            "buffer_minutes": "Minutter, der lægges oven i rejsetiden, for eksempel til parkering, fra 0 til 120. Afgang er starttidspunktet minus rejsetiden og den ekstra tid.",
+            "leave_reminder": "Tilføj en påmindelse ved afgang. I en delt iCloud-kalender ringer den kun på enheder, der er logget ind på denne konto. De andre slår Tid til at tage af sted til på deres egen iPhone."
           }
         }
+      },
+      "error": {
+        "waze_unavailable": "Handlingen fra Waze Travel Time findes ikke. Tilføj først integrationen Waze Travel Time, eller vælg en anden rejsetid."
       },
       "abort": {
         "entry_not_loaded": "Kontoen er ikke indlæst. Ret kontoen først, og prøv så igen.",
@@ -124,6 +151,24 @@
     "target_calendar_missing": {
       "title": "Målkalenderen mangler for {relay}",
       "description": "Videresendelsen {relay} kunne ikke skrive i kalenderen {calendar}, fordi serveren siger, at den ikke findes, eller fordi den ikke er en kalender på denne konto (for eksempel efter at kontoen er skiftet til en anden bruger). Den kan være slettet eller ikke længere delt med kontoen. Omkonfigurer videresendelsen for at vælge en anden målkalender, eller gendan kalenderen. Beskeden forsvinder efter den næste vellykkede synkronisering."
+    }
+  },
+  "selector": {
+    "travel_time": {
+      "options": {
+        "off": "Fra",
+        "fixed": "Fast antal minutter",
+        "waze": "Waze Travel Time"
+      }
+    },
+    "waze_region": {
+      "options": {
+        "us": "USA",
+        "na": "Nordamerika",
+        "eu": "Europa",
+        "il": "Israel",
+        "au": "Australien"
+      }
     }
   }
 }

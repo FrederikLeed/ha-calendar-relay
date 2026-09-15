@@ -1,4 +1,4 @@
-"""Tests for iCalendar rendering."""
+"""Tests for iCalendar rendering. Places and coordinates are invented."""
 
 from __future__ import annotations
 
@@ -9,15 +9,21 @@ import pytest
 
 from custom_components.calendar_relay.ics import (
     PRODID,
+    StructuredLocation,
     clean_text,
     content_hash,
     escape_text,
     fold_line,
+    format_duration,
+    format_geo_uri,
+    quote_param,
     render_event,
+    structured_location_line,
 )
 
 COPENHAGEN = ZoneInfo("Europe/Copenhagen")
 STAMP = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+KICKOFF = datetime(2026, 9, 20, 10, 0, tzinfo=UTC)
 
 
 def unfold(text: str) -> str:
@@ -134,7 +140,7 @@ def test_render_full_event_structure() -> None:
         "END:VCALENDAR",
     ]
     assert PRODID == "-//calendar-relay//Calendar Relay for Home Assistant//EN"
-    for word in ("VALARM", "ORGANIZER", "ATTENDEE"):
+    for word in ("VALARM", "ORGANIZER", "ATTENDEE", "X-APPLE"):
         assert word not in ics
 
 
@@ -150,11 +156,19 @@ def test_empty_description_and_location_are_left_out() -> None:
 
 def test_content_hash_ignores_nothing_but_dtstamp() -> None:
     """The hash input is rendered without DTSTAMP, so it is stable; any content change alters it."""
-    kwargs = {"uid": "u", "summary": "Home - Away", "start": date(2026, 9, 18), "end": date(2026, 9, 19)}
+    kwargs = {"uid": "u", "summary": "Home - Away", "start": KICKOFF, "end": KICKOFF}
     first = content_hash(render_event(**kwargs))
     assert first == content_hash(render_event(**kwargs))
-    assert first != content_hash(render_event(**{**kwargs, "summary": "Away - Home"}))
-    assert first != content_hash(render_event(**{**kwargs, "location": "Pitch 3"}))
+    changes = [
+        {"summary": "Away - Home"},
+        {"location": "Pitch 3"},
+        {"structured_location": StructuredLocation("Example Park", 55.1, 10.2)},
+        {"travel_minutes": 25},
+        {"travel_minutes": 25, "alarm_minutes": 25},
+    ]
+    hashes = {content_hash(render_event(**{**kwargs, **change})) for change in changes}
+    assert first not in hashes
+    assert len(hashes) == len(changes)
 
 
 def test_naive_datetime_is_rejected() -> None:
@@ -185,13 +199,142 @@ def test_lone_surrogates_are_replaced() -> None:
         end=date(2026, 9, 21),
         description="\udc00" * 40,
         location="Pitch \ud83d",
+        structured_location=StructuredLocation("Pitch \ud83d", 55.1, 10.2, "Road \udc00"),
     )
     ics.encode("utf-8")
     assert "SUMMARY:Broken �\r\n" in ics
     assert "LOCATION:Pitch �\r\n" in ics
+    assert 'X-ADDRESS="Road �";X-APPLE-RADIUS=71;X-TITLE="Pitch �":' in unfold(ics)
 
 
 def test_mixed_date_and_datetime_is_rejected() -> None:
     """Start and end must have the same type."""
     with pytest.raises(ValueError):
         render_event(uid="u", summary="s", start=date(2026, 9, 20), end=datetime(2026, 9, 20, 11, tzinfo=UTC))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Example Park", '"Example Park"'),
+        ("Road 1, 1234 Sampletown; Hall: B", '"Road 1, 1234 Sampletown; Hall: B"'),
+        ("Example Park\nRoad 1\r\nSampletown\rDenmark", '"Example Park\\nRoad 1\\nSampletown\\nDenmark"'),
+        ('The "Big" Hall', "\"The 'Big' Hall\""),
+        ("Bad\x00\x07\x7f\tchars", '"Bad\tchars"'),
+        ("Ærø Idrætspark ⚽", '"Ærø Idrætspark ⚽"'),
+        ("Back\\slash", '"Back\\slash"'),
+        ("", '""'),
+        # Sequences readers would decode are neutralised, so the value reads back as one line without DQUOTEs.
+        ("Hall A\\nB and C\\ND", '"Hall A/nB and C/ND"'),
+        ("Caf^n ^' x ^^ y ^x ^N", '"Cafn \' x ^ y ^x N"'),
+        ('Quote^"d', '"Quote\'d"'),
+        ("Back\\^n", '"Back/n"'),
+        ("Caret^\\n", '"Caret^/n"'),
+        ("Line^\nbreak", '"Line^\\nbreak"'),
+    ],
+)
+def test_quote_param(value: str, expected: str) -> None:
+    """Values are always quoted; a line break becomes backslash n, DQUOTE an apostrophe, nothing else is escaped."""
+    assert quote_param(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("minutes", "expected"),
+    [(0, "PT0M"), (5, "PT5M"), (45, "PT45M"), (60, "PT1H"), (90, "PT1H30M"), (125, "PT2H5M"), (1440, "PT24H")],
+)
+def test_format_duration(minutes: int, expected: str) -> None:
+    """Durations are written with hours and minutes, the way Apple writes them."""
+    assert format_duration(minutes) == expected
+
+
+def test_negative_duration_is_rejected() -> None:
+    """A travel time is never negative."""
+    with pytest.raises(ValueError):
+        format_duration(-5)
+
+
+def test_format_geo_uri() -> None:
+    """Latitude and longitude are separated by a comma, with 6 decimals and a dot."""
+    assert format_geo_uri(55.1234567, -10.2) == "geo:55.123457,-10.200000"
+    assert format_geo_uri(-90, 180) == "geo:-90.000000,180.000000"
+
+
+def test_render_location_details_travel_time_and_alarm() -> None:
+    """Structured location follows LOCATION; travel duration and the alarm come before the end of the event."""
+    ics = render_event(
+        uid="u@calendar-relay",
+        summary="⚽ Emma: Home - Away",
+        start=KICKOFF,
+        end=datetime(2026, 9, 20, 11, 30, tzinfo=UTC),
+        description="Bring water",
+        location="Example Stadium\nExample Road 1, 1234 Sampletown",
+        structured_location=StructuredLocation(
+            "Example Stadium", 55.123456, 10.654321, "Example Road 1, 1234 Sampletown"
+        ),
+        travel_minutes=35,
+        alarm_minutes=35,
+        dtstamp=STAMP,
+    )
+    assert unfold(ics).split("\r\n")[:-1] == [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        f"PRODID:{PRODID}",
+        "BEGIN:VEVENT",
+        "UID:u@calendar-relay",
+        "DTSTAMP:20260915T120000Z",
+        "DTSTART:20260920T100000Z",
+        "DTEND:20260920T113000Z",
+        "SUMMARY:⚽ Emma: Home - Away",
+        "DESCRIPTION:Bring water",
+        "LOCATION:Example Stadium\\nExample Road 1\\, 1234 Sampletown",
+        'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS="Example Road 1, 1234 Sampletown";X-APPLE-RADIUS=71;'
+        'X-TITLE="Example Stadium":geo:55.123456,10.654321',
+        "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT35M",
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:⚽ Emma: Home - Away",
+        "TRIGGER:-PT35M",
+        "END:VALARM",
+        "END:VEVENT",
+        "END:VCALENDAR",
+    ]
+    for word in ("X-APPLE-TRAVEL-START", "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR", "X-APPLE-MAPKIT-HANDLE", "GEO:"):
+        assert word not in ics
+
+
+def test_structured_location_without_address() -> None:
+    """Without an address only the title is written, as Apple Calendar exports a one-line place."""
+    line = structured_location_line(StructuredLocation("Example Park, Road 1, 1234 Sampletown", 55.5, -3.25))
+    assert line == (
+        'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-APPLE-RADIUS=71;X-TITLE="Example Park, Road 1, 1234 Sampletown"'
+        ":geo:55.500000,-3.250000"
+    )
+
+
+def test_structured_location_folds_without_splitting_characters() -> None:
+    """A long structured location is folded inside its parameters, never through a multi-byte character."""
+    prefix = 'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-APPLE-RADIUS=71;X-TITLE="'
+    assert len(prefix.encode()) == 65
+    title = "a" * 9 + "ø Idrætspark ⚽, Øster Allé 12; Hal: B " * 3
+    ics = render_event(
+        uid="u",
+        summary="s",
+        start=KICKOFF,
+        end=KICKOFF,
+        location=title,
+        structured_location=StructuredLocation(title, 55.5, 10.25),
+    )
+    physical = ics.split("\r\n")
+    index = next(i for i, line in enumerate(physical) if line.startswith("X-APPLE-STRUCTURED-LOCATION"))
+    assert physical[index] == prefix + "a" * 9
+    assert physical[index + 1].startswith(" ø")
+    continuation = [physical[index]]
+    for line in physical[index + 1 :]:
+        if not line.startswith(" "):
+            break
+        continuation.append(line)
+    assert len(continuation) >= 3
+    assert all(len(line.encode("utf-8")) <= 75 for line in continuation)
+    assert "".join([continuation[0], *(line[1:] for line in continuation[1:])]) == (
+        f'{prefix}{title}":geo:55.500000,10.250000'
+    )

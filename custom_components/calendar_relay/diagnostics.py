@@ -13,6 +13,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from . import CalendarRelayConfigEntry
+from .const import WAZE_DOMAIN, WAZE_SERVICE
 
 TO_REDACT = {CONF_URL, CONF_USERNAME, CONF_PASSWORD}
 
@@ -33,6 +34,11 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: Calenda
                 "remove_filter": relay.config.remove_filter,
                 "has_title_prefix": bool(relay.config.title_prefix),
                 "look_ahead_days": relay.config.look_ahead_days,
+                "structured_location": relay.config.structured_location,
+                "travel_time": relay.config.travel_time,
+                "buffer_minutes": relay.config.buffer_minutes,
+                "leave_reminder": relay.config.leave_reminder,
+                "waze_available": hass.services.has_service(WAZE_DOMAIN, WAZE_SERVICE),
                 "relayed_events": relay.relayed_events,
                 "syncing": relay.syncing,
                 "last_sync": relay.last_sync.isoformat() if relay.last_sync else None,

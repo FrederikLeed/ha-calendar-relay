@@ -10,34 +10,51 @@ status: active
 Custom integration (domain `calendar_relay`) that pushes events from Home Assistant calendar entities
 into a CalDAV calendar (iCloud, Nextcloud, Radicale) and keeps them in step, one way, without churn.
 Motivating use: relay KampKlar call-ups (`⭐ Udtaget: ` titles) into the shared iCloud Family calendar
-with a per-child prefix.
+with a per-child prefix, plus the match's place and when to leave.
 
 ## Current state
 
 - v0.1.0 released 2026-09-15 and installed through HACS on the owner's production Home Assistant
   (2026.9.1); the account and first relay are set up there by the owner. Public repo, so no personal data.
+- v0.2.0 (GitHub issue #1, location details and when to leave) implemented locally on 2026-09-15: place
+  details for Apple Calendar, travel time (fixed or Waze Travel Time) with a leave line, and an optional
+  leave reminder. Released 2026-09-15 after the test suite and a local hassfest run (no CI); the place
+  details, travel block and leave reminder are still to be confirmed on an iPhone.
 - No GitHub Actions (owner's choice): lint, tests and the Home Assistant validations are run locally
   before each release. The one CI run before the workflows were removed was green (lint, tests, hassfest,
   HACS validation).
-- Tests: pytest-homeassistant-custom-component 0.13.365 (HA 2026.9.2, Python 3.14), including an
-  end-to-end test with core `local_calendar` and a real Radicale 3.8.0 server in a thread.
-- Verified against a live iCloud account on 2026-09-15: discovery lands on the account's partition host
-  (pNN-caldav.icloud.com), the shared Family calendar is offered as writable, a relayed event was created,
-  left alone by a repeat sync, and deleted when the filter stopped matching.
+- Tests: 437 passing, 99% coverage (relay, ics, location and config flow at 100%), including regression
+  tests for the adversarial review of 0.2.0 (Waze starvation, overflow, churn after a home change, shared
+  Waze queue, started events, 0,0, Google links, parameter decoding);
+  pytest-homeassistant-custom-component 0.13.365 (HA 2026.9.2, Python 3.14), including an end-to-end test
+  with core `local_calendar`, a stand-in Waze Travel Time action and a real Radicale 3.8.0 server in a
+  thread.
+- Verified against a live iCloud account on 2026-09-15 (0.1.0): discovery lands on the account's partition
+  host (pNN-caldav.icloud.com), the shared Family calendar is offered as writable, a relayed event was
+  created, left alone by a repeat sync, and deleted when the filter stopped matching.
 
 ## How it works
 
 - One config entry per CalDAV account (URL, username, password; unique id = host + username).
   Reauth on 401/403, reconfigure for URL/username (password optional there).
 - Relays are config subentries (type `relay`): source calendar entity, target calendar URL, title filter,
-  remove-filter flag, prefix, look-ahead days. Subentry changes only notify update listeners, so the
-  entry registers one listener that reloads it.
+  remove-filter flag, prefix, look-ahead days, and since 0.2.0 structured location (default on), travel
+  time mode (off/fixed/waze), fixed minutes, Waze region, buffer minutes, leave reminder. Subentry changes
+  only notify update listeners, so the entry registers one listener that reloads it.
 - `caldav.py` is a standalone aiohttp client (no HA imports, ElementTree XML, Basic header built by hand).
   Redirects are followed manually; credentials only go to the same host or, over https, a sibling under
   the same parent domain (caldav.icloud.com to pNN-caldav.icloud.com).
 - `relay.py` reads the entity object's `async_get_events` (the service drops uid), plans the wanted
-  events, PUTs new or changed ones, DELETEs withdrawn future ones, forgets started ones. State per relay in
-  `Store` (`calendar_relay.<subentry_id>`): key to href, content hash, start, end, target URL.
+  events, asks Waze where needed, PUTs new or changed ones, DELETEs withdrawn future ones, forgets started
+  ones. State per relay in `Store` (`calendar_relay.<subentry_id>`): `events` maps key to href, content
+  hash, start, end, target URL; `travel` maps key to Waze minutes, a fingerprint hash of origin,
+  destination and region, a place hash of the destination alone, computed_at, a realtime flag and the
+  event start it was computed for; `travel_retry` maps key to the failing fingerprint, failures in a row,
+  retry_at and the error text.
+- `location.py` (no HA imports) finds coordinates in the description, then the location: geo: URIs, Apple
+  Maps (`ll`, `coordinate`, `destination`, `daddr`, `q`), Google Maps (`query`, `q`, `destination`,
+  `@lat,lon`), OpenStreetMap (`mlat`/`mlon`); the first valid one wins. `ics.py` renders the Apple
+  properties with a DQUOTE parameter helper.
 - Resource name `relay-<sha256(subentry_id + key)[:32]>.ics`, UID `<same>@calendar-relay`.
 - Triggers: `async_at_started`, source state change (Debouncer 30 s), 15 min interval, Sync now button.
 
@@ -65,3 +82,40 @@ with a per-child prefix.
 - Minimum HA 2026.3.0 (local brand folder, Python 3.14 test stack). No `via_device_id`, so relay devices
   hang off the account entry and subentry only.
 - HACS validation also checks the repository description, topics and issues; they are set on GitHub.
+- Apple properties (undocumented; format from Apple-written samples, Apple's archived Calendar Server and
+  decompiled iOS 18.2): `X-APPLE-STRUCTURED-LOCATION;VALUE=URI;[X-ADDRESS="..."];X-APPLE-RADIUS=71;
+  X-TITLE="...":geo:lat,lon` right after LOCATION, with title = first LOCATION line and address = the
+  rest, as Apple writes it; parameters always quoted, line break as backslash n, DQUOTE as apostrophe.
+  No MapKit handle, REFERENCEFRAME, TRAVEL-START (it would publish the home location), ADVISORY-BEHAVIOR
+  or TRAVEL-RETURN.
+- Calendar Server keeps VALARM and every X- property except X-APPLE-STRUCTURED-LOCATION per user, so on
+  a shared iCloud calendar the travel block and the reminder most likely only reach the relay's own Apple
+  Account; the leave line in DESCRIPTION is what every member sees. Not yet checked with two Apple IDs.
+- `X-APPLE-TRAVEL-DURATION` = travel + buffer, so Apple's travel block starts at the leave time. The
+  VALARM trigger is relative to the start.
+- Waze: only keys that exist in HA 2026.3 are sent (the action schema rejects others, so no `time_delta`
+  or `base_coordinates`). The action exists from 2026.8 whenever the integration is loaded, before that
+  only while a Waze entry is loaded; the subentry flow checks `has_service`. Asked once per destination
+  (non-realtime), once more with realtime within 3 h of the start or from 1 h before the leave time when
+  that is earlier, never after the leave time, and again for a moved start (the record stores the start
+  it was for); a single realtime call if already within 3 h. Rounded up to 5 min; answers over 8 h are
+  failures (a huge value used to overflow the leave-time arithmetic and block removals).
+- Waze failures are per event: the event keeps its value for the same place (a new home or region keeps
+  it until Waze answers, a new place drops it) and backs off 1 h doubling to 24 h, stored as
+  `travel_retry` so restarts do not reset it; other events are still asked, nearest first. A pass stops
+  asking after 10 calls, 3 failures in a row, a 30 s timeout, or a missing action. All relays share one
+  queue in `hass.data` (one call at a time, 0.5 s pause, like HA's own Waze sensors; the action itself has
+  no throttle) and reuse answers for the same fingerprint and traffic mode for 15 min. Travel problems set
+  `last_error` but do not hold back `last_sync` or the repair-issue cleanup. Errors only show the exception
+  type (no address in diagnostics).
+- Travel time only for timed events with a place (coordinates or location text). A started event only
+  keeps travel time it was already written with (same hash and calendar), so no past leave line or alarm
+  is written. The leave line says "the day before" / "dagen før" when the leave time is on an earlier date.
+- Coordinates: 0,0 is rejected (generators write it for a missing place); Google place links use the
+  `!3d!4d` pin, directions the last waypoint (never the `@` view centre); a closing bracket after a link is
+  only kept when the link opened it. Parameter values drop carets before n, ' or ^ and turn backslash-n
+  into /n, so iOS and RFC 6868 readers read X-TITLE like LOCATION.
+- Radicale (vobject) cuts unknown property values at the first unescaped comma, so its copy of the geo URI
+  keeps only the latitude, and it unquotes parameters that do not need quotes; the e2e test pins that.
+- No config entry migration: `RelayConfig.from_data` defaults the new keys, and an event without
+  coordinates renders byte-identically to 0.1.0, so upgrading rewrites nothing.
