@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import socket
 import threading
 import time
@@ -21,6 +22,8 @@ from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, Supp
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry, setup_test_component_platform
+from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker, AiohttpClientMockResponse
+from yarl import URL
 
 from custom_components.calendar_relay.caldav import DavCalendar, is_event_href
 from custom_components.calendar_relay.const import (
@@ -92,7 +95,11 @@ def _as_datetime(value: date | datetime) -> datetime:
 
 
 class FakeDav:
-    """In-memory stand-in for CalDavClient. Calling the instance acts as the class."""
+    """In-memory stand-in for CalDavClient. Calling the instance acts as the class.
+
+    With serve it is a test server instead: it answers the real client's PUT and DELETE
+    requests over aioclient_mock, the way iCloud does.
+    """
 
     def __init__(self) -> None:
         """Offer a usable Family and Work calendar plus two that cannot be targets."""
@@ -108,6 +115,33 @@ class FakeDav:
         self.discover_error: Exception | None = None
         self.put_error: Exception | Callable[[str, str], Exception | None] | None = None
         self.delete_error: Exception | None = None
+        # Served over HTTP: hrefs opened on an Apple device, which answer a plain PUT with 412 until they are
+        # deleted, hrefs whose other PUTs answer with a status instead of writing, and the body of those answers.
+        self.opened: set[str] = set()
+        self.failing: dict[str, int] = {}
+        self.refusal_body = ""
+
+    def serve(self, aioclient_mock: AiohttpClientMocker, calendar_url: str = FAMILY_URL) -> None:
+        """Answer PUT and DELETE of the relay's event resources in calendar_url."""
+        resources = re.compile(f"^{re.escape(calendar_url)}relay-[0-9a-f]{{32}}\\.ics$")
+        for method in ("PUT", "DELETE"):
+            aioclient_mock.request(method, resources, side_effect=self._async_answer)
+
+    async def _async_answer(self, method: str, url: URL, data: bytes | None) -> AiohttpClientMockResponse:
+        """Answer one request: 201 or 204 for a PUT, 412 while opened or the failing status, 204 or 404 for a DELETE."""
+        href = str(url)
+        method = method.upper()
+        self.calls.append((method, href))
+        if method == "DELETE":
+            self.opened.discard(href)
+            status = 204 if self.resources.pop(href, None) is not None else 404
+            return AiohttpClientMockResponse(method, url, status=status)
+        if href in self.opened or href in self.failing:
+            status = 412 if href in self.opened else self.failing[href]
+            return AiohttpClientMockResponse(method, url, status=status, text=self.refusal_body)
+        status = 204 if href in self.resources else 201
+        self.resources[href] = (data or b"").decode()
+        return AiohttpClientMockResponse(method, url, status=status)
 
     def __call__(self, session: Any, url: str, username: str, password: str) -> FakeDav:
         """Record the client arguments and return the fake."""
@@ -159,6 +193,15 @@ def fake_dav() -> Generator[FakeDav]:
     """Replace the CalDAV client everywhere the integration creates one."""
     fake = FakeDav()
     with patch("custom_components.calendar_relay.CalDavClient", new=fake):
+        yield fake
+
+
+@pytest.fixture
+def dav_server(aioclient_mock: AiohttpClientMocker) -> Generator[FakeDav]:
+    """Run the real CalDAV client against FakeDav serving the Family calendar; discovery returns its calendars."""
+    fake = FakeDav()
+    fake.serve(aioclient_mock)
+    with patch("custom_components.calendar_relay.caldav.CalDavClient.async_discover", return_value=fake.calendars):
         yield fake
 
 

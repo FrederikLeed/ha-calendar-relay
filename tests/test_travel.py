@@ -412,6 +412,32 @@ async def test_live_traffic_that_changes_the_rounded_minutes_rewrites_once(
     assert "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT35M" in event
 
 
+async def test_live_traffic_rewrite_of_an_entry_opened_on_an_apple_device_deletes_it_and_writes_it_again(
+    hass: HomeAssistant,
+    source_calendar: FakeCalendar,
+    dav_server: FakeDav,
+    waze: FakeWaze,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Not only a changed source event: a rewrite for a new travel time an hour before the match also meets iCloud's
+    412 on an entry someone opened, so the entry is deleted and written again, as the README's limits say."""
+    source_calendar.events = [match()]
+    entry = waze_entry()
+    await setup_entry(hass, entry)
+    [href] = dav_server.puts()
+    dav_server.opened.add(href)
+    dav_server.calls.clear()
+
+    waze.duration = 31
+    freezer.move_to(KICKOFF - timedelta(hours=1))
+    await relay_of(entry).async_sync()
+
+    assert dav_server.calls == [("PUT", href), ("DELETE", href), ("PUT", href)]
+    assert waze.realtime_flags() == [False, True]
+    assert "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT35M" in lines(dav_server)
+    assert relay_of(entry).last_error is None
+
+
 async def test_event_starting_soon_is_asked_once_with_live_traffic(
     hass: HomeAssistant, source_calendar: FakeCalendar, fake_dav: FakeDav, waze: FakeWaze
 ) -> None:

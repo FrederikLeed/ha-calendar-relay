@@ -312,15 +312,34 @@ written without alerts.
 - The server refuses one event with a reason (403 or 409 with a CalDAV precondition, such as a UID that
   already exists in another calendar): only that event fails, the rest of the sync goes on, and the next
   sync tries it again.
+- The server will not replace an event and answers 412 (iCloud does this for an entry someone opened on an
+  Apple device): the relay deletes the entry and writes it again, once. If writing it again fails, the entry
+  is missing until a later sync writes it, and the failure is handled like any other failed write: a refused
+  event fails alone, a bare 403 starts reauthentication, a missing calendar raises the repair issue, and a
+  timeout or server error waits for the next sync.
 - Waze Travel Time is missing or fails: events keep their last travel time, and `last_error` starts with
   `Travel time:` and says why. See [Travel time](#travel-time).
 - Anything else (timeouts, rate limits, server errors): a warning in the log, and the next sync tries again.
 
+When the server's answer names no CalDAV precondition, the warning quotes up to 160 characters of it, with
+credentials, echoed request headers, addresses and paths removed. If the account's username or password is
+part of a longer word in the answer, nothing of the answer is quoted. The answer can quote event text, so
+`last_error` and diagnostics only show the status, and a log is worth reading before you share it.
+
 ## Limits
 
-- One way only. Changes made to a relayed event in the target calendar are kept until the source event
-  changes, then overwritten.
-- An event you delete by hand from the target calendar is not recreated unless its source event changes.
+- One way only. Changes made to a relayed event in the target calendar are kept until the relay rewrites
+  the event, then overwritten. The relay rewrites an event when its source event changes, when its travel
+  time changes (including the live traffic update in the hours before it starts), and when a setting that
+  shapes it changes, such as the title prefix or Home Assistant's time zone.
+- An event you delete by hand from the target calendar is not recreated until the relay rewrites it.
+- On iCloud, an entry someone has opened on an Apple device cannot be replaced in place, so every rewrite
+  deletes the entry and writes it again. Devices may show it as a new event, and alerts added by hand on it
+  are lost; with Waze Travel Time this can happen shortly before a match, when live traffic changes the
+  travel time. If writing it again fails, the entry is missing until a later sync writes it, also when the
+  source event has changed back in the meantime; an event that is over by then stays missing. An entry
+  that has already started when it is written again gets no leave line or leave reminder, like any
+  rewritten event that has started.
 - A withdrawn event is deleted only if it has not started yet. Running and past events stay in the target
   calendar.
 - Removing a relay, or the whole account, leaves its events in the target calendar. To remove them first,

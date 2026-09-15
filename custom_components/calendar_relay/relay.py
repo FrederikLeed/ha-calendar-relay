@@ -619,10 +619,11 @@ class Relay:
             if complete and self._removals_confirmed(events, now):
                 await self._async_remove_unwanted(planned, now, failures)
             self._forget_travel(planned)
+        # Warnings show the whole error; last_error only its summary, since an excerpt of the answer can quote events.
         except CalDavAuthError as err:
             LOGGER.warning("Relay %s: the server refused the request (%s), starting reauthentication", self.title, err)
             self.entry.async_start_reauth(self.hass)
-            return f"Authentication failed ({err})"
+            return f"Authentication failed ({err.summary})"
         except CalDavNotFoundError as err:
             LOGGER.warning("Relay %s: the target calendar does not exist (%s)", self.title, err)
             ir.async_create_issue(
@@ -635,10 +636,10 @@ class Relay:
                 translation_key=ISSUE_TARGET_MISSING,
                 translation_placeholders={"relay": self.title, "calendar": self.config.target_name},
             )
-            return f"Target calendar not found ({err})"
+            return f"Target calendar not found ({err.summary})"
         except CalDavConnectionError as err:
             LOGGER.warning("Relay %s: sync failed, retrying on the next pass: %s", self.title, err)
-            return str(err)
+            return err.summary
         finally:
             if self._dirty:
                 await self._store.async_save(
@@ -962,7 +963,9 @@ class Relay:
         start reauthentication.
         """
         if isinstance(err, CalDavAuthError) and err.status == 403 and not self._on_account(calendar_url):
-            return CalDavNotFoundError(err.status, err.condition)
+            converted = CalDavNotFoundError(err.status, err.condition, err.excerpt)
+            converted.resource_deleted = err.resource_deleted
+            return converted
         return err
 
     async def _async_put(self, calendar_url: str, item: PlannedEvent, now: datetime) -> str:
@@ -1005,7 +1008,11 @@ class Relay:
         self._dirty = True
 
     async def _async_write_planned(self, planned: dict[str, PlannedEvent], now: datetime, failures: list[str]) -> None:
-        """PUT new events and events whose content changed; move events whose target calendar changed."""
+        """PUT new events and events whose content changed; move events whose target calendar changed.
+
+        When a write fails after the client deleted the event to write it again (iCloud's 412), the
+        stored hash is cleared, so the next pass writes the event whatever it holds by then.
+        """
         target = self.config.target
         for key, item in planned.items():
             record = self._events.get(key)
@@ -1016,11 +1023,14 @@ class Relay:
                 continue
             try:
                 href = await self._async_put(target, item, now)
-            except _PASS_ENDING_ERRORS:
-                raise
             except CalDavError as err:
+                if record is not None and err.resource_deleted:
+                    self._events[key] = {**record, "hash": ""}
+                    self._dirty = True
+                if isinstance(err, _PASS_ENDING_ERRORS):
+                    raise
                 LOGGER.warning("Relay %s: writing an event failed, retrying on the next pass: %s", self.title, err)
-                failures.append(str(err))
+                failures.append(err.summary)
                 continue
             self._remember(key, item, href, target)
 
@@ -1061,11 +1071,11 @@ class Relay:
                 await self._async_restore(key, record, item, now)
             if isinstance(err, _ACCOUNT_ERRORS):
                 raise
-            message = f"Moving an event to the new calendar failed: {err}"
+            message = f"Moving an event to the new calendar failed: {err.summary}"
             self._failed_moves[key] = (target, item.content_hash, message)
             if isinstance(err, CalDavNotFoundError):
                 raise
-            LOGGER.warning("Relay %s: %s", self.title, message)
+            LOGGER.warning("Relay %s: moving an event to the new calendar failed: %s", self.title, err)
             failures.append(message)
             return
         self._failed_moves.pop(key, None)
@@ -1101,7 +1111,7 @@ class Relay:
                         LOGGER.warning(
                             "Relay %s: deleting an event failed, retrying on the next pass: %s", self.title, err
                         )
-                        failures.append(str(err))
+                        failures.append(err.summary)
                         continue
                     # A copy in a previous target calendar is not retried: that calendar is no longer the relay's.
                     LOGGER.warning(

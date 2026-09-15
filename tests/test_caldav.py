@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import Awaitable, Callable
 
 import aiohttp
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
+from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker, AiohttpClientMockResponse
+from yarl import URL
 
 from custom_components.calendar_relay.caldav import (
+    EXCERPT_WITHHELD,
     CalDavAuthError,
     CalDavClient,
     CalDavConnectionError,
@@ -20,6 +23,7 @@ from custom_components.calendar_relay.caldav import (
     CalDavRefusedError,
     CalDavStatusError,
     DavCalendar,
+    body_excerpt,
     collection_url,
     is_event_href,
     normalize_url,
@@ -32,6 +36,7 @@ FAMILY_UUID = "b8e0edb4-1acd-445a-b20e-66a1bf964bb7"
 SHARED_HEX = "5f" * 32
 EXPECTED_AUTH = "Basic " + base64.b64encode(b"parent@example.com:abcd-efgh-ijkl-mnop").decode()
 CALENDAR = "<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>"
+NO_UID_CONFLICT = '<d:error xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><c:no-uid-conflict/></d:error>'
 
 
 def multistatus(*responses: str) -> str:
@@ -84,6 +89,17 @@ def client(hass: HomeAssistant, url: str = ICLOUD) -> CalDavClient:
 def calls(aioclient_mock: AiohttpClientMocker) -> list[tuple[str, str]]:
     """Return (method, url) of every request."""
     return [(method.upper(), str(url)) for method, url, _data, _headers in aioclient_mock.mock_calls]
+
+
+def answers(*replies: tuple[int, str]) -> Callable[[str, URL, bytes | None], Awaitable[AiohttpClientMockResponse]]:
+    """Return a side effect that answers successive requests with the given status and body, in turn."""
+    queue = list(replies)
+
+    async def answer(method: str, url: URL, data: bytes | None) -> AiohttpClientMockResponse:
+        status, body = queue.pop(0)
+        return AiohttpClientMockResponse(method, url, status=status, text=body)
+
+    return answer
 
 
 def mock_icloud(aioclient_mock: AiohttpClientMocker) -> None:
@@ -256,10 +272,12 @@ async def test_principal_without_home_is_listed(hass: HomeAssistant, aioclient_m
 async def test_discovery_status_errors(
     hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, status: int, error: type[Exception]
 ) -> None:
-    """401 is an auth error; 429 and 5xx are temporary."""
-    aioclient_mock.request("PROPFIND", ICLOUD, status=status)
-    with pytest.raises(error):
+    """401 is an auth error; 429 and 5xx are temporary. The message quotes the answer, the summary does not."""
+    aioclient_mock.request("PROPFIND", ICLOUD, status=status, text="Try again later")
+    with pytest.raises(error) as err:
         await client(hass).async_discover()
+    assert str(err.value) == f"{err.value.summary}, response body: Try again later"
+    assert "Try" not in err.value.summary
 
 
 async def test_discovery_forbidden_everywhere_is_auth_error(
@@ -361,13 +379,15 @@ def test_may_authenticate(hass: HomeAssistant, server: str, url: str, expected: 
     assert CalDavClient(None, server, "u", "p")._may_authenticate(url) is expected  # type: ignore[arg-type]
 
 
-async def test_put_creates_event(hass: HomeAssistant, aioclient_mock: AiohttpClientMocker) -> None:
-    """PUT sends UTF-8 iCalendar data into the collection and returns the resource URL."""
+@pytest.mark.parametrize("status", [201, 204])
+async def test_put_creates_event(hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, status: int) -> None:
+    """PUT sends UTF-8 iCalendar data into the collection and returns the resource URL; it never deletes."""
     href = f"{ICLOUD_HOME}family/relay-0123abcd.ics"
-    aioclient_mock.put(href, status=201)
+    aioclient_mock.put(href, status=status)
     ics = "BEGIN:VCALENDAR\r\nSUMMARY:⚽ Emma: Home - Away\r\nEND:VCALENDAR\r\n"
     result = await client(hass).async_put_event(f"{ICLOUD_HOME}family", "relay-0123abcd.ics", ics)
     assert result == href
+    assert calls(aioclient_mock) == [("PUT", href)]
     _method, _url, data, headers = aioclient_mock.mock_calls[0]
     assert data == ics.encode("utf-8")
     assert headers["Content-Type"] == "text/calendar; charset=utf-8"
@@ -393,7 +413,7 @@ async def test_put_follows_redirect_to_partition_host(hass: HomeAssistant, aiocl
 
 
 @pytest.mark.parametrize(
-    ("status", "body", "error", "condition"),
+    ("status", "body", "error", "condition", "message"),
     [
         (
             403,
@@ -401,18 +421,26 @@ async def test_put_follows_redirect_to_partition_host(hass: HomeAssistant, aiocl
             "</d:error>",
             CalDavRefusedError,
             "unique-scheduling-object-resource",
+            "HTTP 403 (unique-scheduling-object-resource)",
+        ),
+        (409, NO_UID_CONFLICT, CalDavRefusedError, "no-uid-conflict", "HTTP 409 (no-uid-conflict)"),
+        (403, "", CalDavAuthError, None, "HTTP 403"),
+        (404, "", CalDavNotFoundError, None, "HTTP 404"),
+        (409, "Conflict", CalDavNotFoundError, None, "HTTP 409, response body: Conflict"),
+        (
+            400,
+            '<d:error xmlns:d="DAV:"/>',
+            CalDavStatusError,
+            None,
+            'HTTP 400, response body: <d:error xmlns:d="DAV:"/>',
         ),
         (
-            409,
-            '<d:error xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><c:no-uid-conflict/></d:error>',
-            CalDavRefusedError,
-            "no-uid-conflict",
+            415,
+            '<d:multistatus xmlns:d="DAV:"/>',
+            CalDavStatusError,
+            None,
+            'HTTP 415, response body: <d:multistatus xmlns:d="DAV:"/>',
         ),
-        (403, "", CalDavAuthError, None),
-        (404, "", CalDavNotFoundError, None),
-        (409, "Conflict", CalDavNotFoundError, None),
-        (412, '<d:error xmlns:d="DAV:"/>', CalDavStatusError, None),
-        (415, '<d:multistatus xmlns:d="DAV:"/>', CalDavStatusError, None),
     ],
 )
 async def test_put_errors(
@@ -422,16 +450,209 @@ async def test_put_errors(
     body: str,
     error: type[CalDavStatusError],
     condition: str | None,
+    message: str,
 ) -> None:
     """A 403 or 409 with a DAV:error reason refuses this event only (CalendarServer answers a UID that exists
     in another calendar with 403, Radicale a UID conflict with 409). A bare 403 is an auth error; 404 and a
-    bare 409 mean the calendar is missing."""
+    bare 409 mean the calendar is missing. Without a reason the message quotes the answer. Only 412 deletes."""
     aioclient_mock.put(f"{ICLOUD_HOME}family/relay-1.ics", status=status, text=body)
     with pytest.raises(error) as err:
         await client(hass).async_put_event(f"{ICLOUD_HOME}family/", "relay-1.ics", "X")
     assert type(err.value) is error
     assert err.value.status == status
     assert err.value.condition == condition
+    assert str(err.value) == message
+    assert err.value.summary == message.split(",", 1)[0]
+    assert err.value.resource_deleted is False
+    assert len(aioclient_mock.mock_calls) == 1
+
+
+@pytest.mark.parametrize("delete_status", [204, 200, 404, 410])
+async def test_put_refused_with_412_deletes_the_resource_and_writes_it_again(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, delete_status: int
+) -> None:
+    """iCloud answers a plain PUT to an entry opened on an Apple device with 412 and no DAV:error condition.
+
+    The resource is deleted, also when it is already gone (404 or 410), and written once more.
+    """
+    href = f"{ICLOUD_HOME}family/relay-1.ics"
+    aioclient_mock.put(href, side_effect=answers((412, ""), (201, "")))
+    aioclient_mock.delete(href, status=delete_status)
+    ics = "BEGIN:VCALENDAR\r\nSUMMARY:⚽ Emma: Home - Away\r\nEND:VCALENDAR\r\n"
+
+    assert await client(hass).async_put_event(f"{ICLOUD_HOME}family/", "relay-1.ics", ics) == href
+    assert calls(aioclient_mock) == [("PUT", href), ("DELETE", href), ("PUT", href)]
+    assert [data for _method, _url, data, _headers in aioclient_mock.mock_calls] == [ics.encode(), None, ics.encode()]
+    assert aioclient_mock.mock_calls[1][3] == {"Authorization": EXPECTED_AUTH}
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "error", "message"),
+    [
+        (412, "Precondition Failed", CalDavStatusError, "HTTP 412, response body: Precondition Failed"),
+        (403, "", CalDavAuthError, "HTTP 403"),
+        (404, "", CalDavNotFoundError, "HTTP 404"),
+        (409, NO_UID_CONFLICT, CalDavRefusedError, "HTTP 409 (no-uid-conflict)"),
+        (503, "", CalDavConnectionError, "PUT returned HTTP 503"),
+    ],
+)
+async def test_put_after_412_is_sent_once(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    status: int,
+    body: str,
+    error: type[CalDavStatusError],
+    message: str,
+) -> None:
+    """A write that fails again after the delete is not retried; its answer raises the way a first answer does, and
+    the error says the resource was deleted."""
+    href = f"{ICLOUD_HOME}family/relay-1.ics"
+    aioclient_mock.put(href, side_effect=answers((412, ""), (status, body)))
+    aioclient_mock.delete(href, status=204)
+    with pytest.raises(error) as err:
+        await client(hass).async_put_event(f"{ICLOUD_HOME}family/", "relay-1.ics", "X")
+    assert type(err.value) is error
+    assert str(err.value) == message
+    assert err.value.resource_deleted is True
+    assert calls(aioclient_mock) == [("PUT", href), ("DELETE", href), ("PUT", href)]
+
+
+@pytest.mark.parametrize(
+    ("delete", "error", "message", "deleted"),
+    [
+        ({"status": 403}, CalDavAuthError, "HTTP 403", False),
+        ({"status": 400, "text": "Bad Request"}, CalDavStatusError, "HTTP 400, response body: Bad Request", False),
+        (
+            {"status": 301, "headers": {"Location": f"{ICLOUD_HOME}family/"}},
+            CalDavError,
+            "Refusing to follow a redirect away from the event resource",
+            False,
+        ),
+        ({"status": 503}, CalDavConnectionError, "DELETE returned HTTP 503", True),
+        ({"exc": TimeoutError()}, CalDavConnectionError, "DELETE failed: TimeoutError", True),
+    ],
+)
+async def test_put_after_412_is_not_sent_when_the_delete_fails(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    delete: dict,
+    error: type[CalDavError],
+    message: str,
+    deleted: bool,
+) -> None:
+    """The DELETE keeps its error mapping and its redirect guard, and nothing is written after it fails. A DELETE
+    without a usable answer may have been carried out, so its error says the resource may be deleted."""
+    calendar = f"{ICLOUD_HOME}family/"
+    href = f"{calendar}relay-1.ics"
+    aioclient_mock.put(href, status=412)
+    aioclient_mock.delete(href, **delete)
+    aioclient_mock.delete(calendar, status=204)
+    with pytest.raises(error) as err:
+        await client(hass).async_put_event(calendar, "relay-1.ics", "X")
+    assert type(err.value) is error
+    assert str(err.value) == message
+    assert err.value.resource_deleted is deleted
+    assert calls(aioclient_mock) == [("PUT", href), ("DELETE", href)]
+
+
+async def test_error_quotes_a_safe_excerpt_of_the_answer(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """The excerpt has whitespace collapsed and at most 160 characters, without credentials, echoed request
+    headers, URLs or account paths. The summary is the status alone."""
+    token = EXPECTED_AUTH.removeprefix("Basic ")
+    body = (
+        "<html>\r\n\t<head><title>415   Unsupported</title></head>\n"
+        f"<body><pre>Authorization: Basic {token}\nCookie: session=abc123\n</pre>"
+        f"Parent@Example.com abcd-efgh-ijkl-mnop\x00\x1b[0m‮ {ICLOUD_HOME}family/relay-1.ics "
+        "/123456789/calendars/family/ " + "event text " * 20 + "</body></html>"
+    )
+    aioclient_mock.put(f"{ICLOUD_HOME}family/relay-1.ics", status=415, text=body)
+    with pytest.raises(CalDavStatusError) as err:
+        await client(hass).async_put_event(f"{ICLOUD_HOME}family/", "relay-1.ics", "X")
+
+    excerpt = err.value.excerpt
+    assert excerpt is not None
+    assert str(err.value) == f"HTTP 415, response body: {excerpt}"
+    assert err.value.summary == "HTTP 415"
+    assert excerpt == (
+        "<html> <head><title>415 Unsupported</title></head> <body><pre>Authorization: [redacted] Cookie: [redacted] "
+        "</pre>[redacted] [redacted] [0m [url] [path] event..."
+    )
+    assert len(excerpt) == 160
+    for private in (token, "abc123", "example.com", "abcd", "icloud", "123456789", "\x1b", "‮", "  "):
+        assert private not in excerpt.lower()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b"", None),
+        (b" \r\n\t ", None),
+        (b"x" * 160, "x" * 160),
+        (b"x" * 161, "x" * 157 + "..."),
+        ("Pr\xe9condition".encode("latin-1"), "Pr�condition"),
+        (b"a secret and a SECRET", "a [redacted] and a [redacted]"),
+        (
+            b'<e:error xmlns:e="http://example.com/ns/"><e:locked/></e:error>',
+            '<e:error xmlns:e="http://example.com/ns/"><e:locked/></e:error>',
+        ),
+        (
+            b"<href>/1/calendars/</href> at /dav, HTTP/1.1 text/calendar 15/09/2026 ftp://example.com/x",
+            "<href>[path]</href> at /dav, HTTP/1.1 text/calendar 15/09/2026 [url]",
+        ),
+    ],
+)
+def test_body_excerpt(body: bytes, expected: str | None) -> None:
+    """A body without text gives no excerpt, a long one is cut, namespaces and slashes that are no paths stay."""
+    assert body_excerpt(body, ("secret", "")) == expected
+
+
+@pytest.mark.parametrize(
+    ("username", "password", "body", "expected"),
+    [
+        (
+            "parent@example.com",
+            "abcd-efgh-ijkl-mnop",
+            b"account parent&#64;example.com is not allowed, PARENT&commat;EXAMPLE.COM.",
+            "account [redacted] is not allowed, [redacted].",
+        ),
+        (
+            "parent@example.com",
+            "abcd-efgh-ijkl-mnop",
+            b'{"user":"parent\\u0040example.com","password":"abcd\\u002Defgh-ijkl-mnop",'
+            b'"title":"\\u26bd \\ud83d\\ude00"}',
+            '{"user":"[redacted]","password":"[redacted]","title":"⚽ 😀"}',
+        ),
+        (
+            "parent@example.com",
+            "abcd-efgh-ijkl-mnop",
+            b"user=parent%40example.com&password=abcd%2Defgh%2Dijkl%2Dmnop, parent%2540example.com \\ud800",
+            "user=[redacted]&password=[redacted], [redacted] �",
+        ),
+        ("parent@example.com", "abcd-efgh-ijkl-mnop", b"grandparent@example.com", EXCERPT_WITHHELD),
+        ("parent@example.com", "abcd-efgh-ijkl-mnop", b"password abcd-efgh-ijkl-mnop-2", EXCERPT_WITHHELD),
+        ("calendar", "abcd-efgh-ijkl-mnop", b"<d:error><c:valid-calendar-data/></d:error>", EXCERPT_WITHHELD),
+        ("a", "abcd-efgh-ijkl-mnop", b"Precondition Failed: resource cannot be replaced", EXCERPT_WITHHELD),
+        ("emma", "emma-secret", b"emma-secret is the password of emma.", "[redacted] is the password of [redacted]."),
+        # A password that itself contains escape-like text is found before decoding changes it,
+        # and in its decoded form when the server decoded it already.
+        (
+            "parent@example.com",
+            "ab%41cd-efgh",
+            b"password ab%41cd-efgh was rejected",
+            "password [redacted] was rejected",
+        ),
+        ("parent@example.com", "ab%41cd-efgh", b"password abAcd-efgh was rejected", "password [redacted] was rejected"),
+        ("parent@example.com", "pa&amp;ss-word", b"login pa&amp;ss-word refused", "login [redacted] refused"),
+        ("parent@example.com", "x\\u0041y-pass", b'{"password":"x\\u0041y-pass"}', '{"password":"[redacted]"}'),
+    ],
+)
+def test_body_excerpt_never_shows_the_credentials(username: str, password: str, body: bytes, expected: str) -> None:
+    """Credentials are found in HTML, JSON and percent-encoded forms too. One that is part of a longer word, such as
+    an everyday word used as the username, withholds the whole excerpt, since [redacted] would show which word."""
+    excerpt = CalDavClient(None, ICLOUD, username, password)._excerpt(body)  # type: ignore[arg-type]
+    assert excerpt == expected
 
 
 @pytest.mark.parametrize("name", ["event.txt", "../x.ics", "a b.ics", "x@y.ics", ".ics"])

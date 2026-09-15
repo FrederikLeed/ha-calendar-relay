@@ -26,10 +26,26 @@ with a per-child prefix, plus the match's place and when to leave.
   Vær der før tid and named in the leave line. Upgrading rewrites each relayed timed event once, in the
   first sync, without extra Waze calls; all-day events are not rewritten. After review the VTIMEZONE is
   the same in every event (yearly rules), because vobject keeps the first one it reads per TZID.
+- v0.2.2 released 2026-09-16 (tests and local hassfest; no CI). Credentials are removed from error
+  excerpts before and after escapes are decoded, each in its given and decoded form, so a password
+  containing text like %41 or &amp; cannot slip through. Live finding on iCloud on 2026-09-15: an entry the
+  relay wrote and the owner then opened on an iPhone can no longer be replaced. A plain PUT (no If-Match or
+  If-None-Match) to it returns 412 with no parseable DAV:error; entries no phone opened update fine
+  (including added VALARM and X-APPLE-TRAVEL-DURATION), and a DELETE of the opened entry returns 204. So a
+  moved match someone had opened stayed at the old time and every pass logged "HTTP 412". Decision: on a
+  412 to an event PUT, the client DELETEs the same resource (same resource and redirect guards; 404 or 410
+  still continues) and PUTs once more, never looping; the second answer is mapped like any PUT answer.
+  The relay sees one successful write (store updated, no extra Waze calls, travel state kept). A PUT to a
+  resource deleted by hand gets 201, so that path never deletes. Also: errors from an answer without a
+  DAV:error condition quote a safe body excerpt (see Decisions). Review fixes the same day: a write that
+  fails after the DELETE clears the stored hash so the next pass rewrites the entry even if the source moved
+  back; the excerpt decodes HTML, JSON and percent escapes before removing credentials and is withheld when
+  a credential sits inside a longer word; README and this brief say delete and recreate happens on any
+  rewrite (source, travel time including live traffic, settings) and how a failed second write is handled.
 - No GitHub Actions (owner's choice): lint, tests and the Home Assistant validations are run locally
   before each release. The one CI run before the workflows were removed was green (lint, tests, hassfest,
   HACS validation).
-- Tests: 485 passing, 99% coverage (relay, ics, location and config flow at 100%), including regression
+- Tests: 527 passing, 99% coverage (relay, ics, location and config flow at 100%), including regression
   tests for the adversarial review of 0.2.0 (Waze starvation, overflow, churn after a home change, shared
   Waze queue, started events, 0,0, Google links, parameter decoding) and for 0.2.1 (Copenhagen summer,
   winter and DST changes, Tokyo, Sydney, the UTC fallback, the one-time upgrade rewrite, arrive early in
@@ -83,7 +99,28 @@ with a per-child prefix, plus the match's place and when to leave.
   unlink it). The stored href is the one inside the target, not the redirected URL.
 - Error mapping during sync: 401 and a bare 403 start reauth; 403 or 409 with a DAV:error precondition
   fail that event only (CalendarServer 403, Radicale 409 `no-uid-conflict`); 404, a bare 409, or a bare
-  403 from a calendar the account does not list raise the target-missing repair issue.
+  403 from a calendar the account does not list raise the target-missing repair issue. A PUT answered 412
+  is replaced by DELETE and one more PUT (0.2.2), on any rewrite of an opened entry: a changed source, a new
+  travel time (also the live traffic update shortly before a match) or changed settings, so devices may
+  show it as new. If the second PUT fails, or the DELETE gets no usable answer (timeout, 429, 5xx), the
+  client sets `resource_deleted` on the error (kept when a foreign 403 becomes a missing calendar) and the
+  relay clears the record's hash, keeping href, start, end and target, so the next pass writes the event
+  whatever it holds (review finding: with the old hash kept, a match moved back to its first time was never
+  written again). The failure itself maps like any PUT: a second 412, 400 or refused event fails alone; a
+  bare 403, 404/409, 429/5xx end the pass. An event that is over before a pass succeeds stays missing: the
+  source no longer returns it.
+- Error text (0.2.2): every error raised from an HTTP answer without a DAV:error condition (PUT, DELETE,
+  discovery, 401, 429/5xx) carries `excerpt`, up to 160 characters of the body. HTML character references,
+  JSON string escapes and percent-encoding are decoded first; then credentials (username, its
+  percent-encoded form, password, Basic token) are replaced at word edges, and a credential inside a longer
+  word (letter, digit, underscore or hyphen next to it, e.g. user `calendar` in `valid-calendar-data`)
+  withholds the whole excerpt (`EXCERPT_WITHHELD`), since `[redacted]` would show the word. Echoed
+  Authorization/Cookie headers, URLs and absolute paths are removed, non-printing characters become spaces
+  and whitespace is collapsed; XML namespace URIs are kept.
+  `str(err)` ends with `, response body: <excerpt>` and goes to warnings; `err.summary` leaves it out and
+  is what `last_error`, the sensor attribute and diagnostics get, because a server may quote event text.
+  Tests for the retry run the real client against FakeDav serving HTTP over aioclient_mock (`dav_server`
+  fixture); the Radicale e2e test cannot produce iCloud's 412, so it is not faked there.
 - Removed relays: a `calendar_relay.relays_<entry_id>` Store lists relay ids with state; setup and
   entry removal drop the state and repair issue of ids no longer present, also when the relay was removed
   while the entry was not loaded.

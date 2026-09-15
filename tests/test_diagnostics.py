@@ -25,13 +25,16 @@ async def test_diagnostics_contain_counts_and_states_only(
     fake_dav: FakeDav,
     config_entry: MockConfigEntry,
 ) -> None:
-    """No credentials, URLs, entity ids, titles or names; just counts and states."""
+    """No credentials, URLs, entity ids, titles or names; just counts and states. An excerpt of an answer can quote
+    an event, so last_error has the status alone."""
     start = datetime.now(UTC) + timedelta(days=2)
     source_calendar.events = [
         timed(f"{CALL_UP}Home - Away", start),
         timed(f"{CALL_UP}Cup", start + timedelta(days=1), uid="cup"),
     ]
-    fake_dav.put_error = lambda href, ics: CalDavStatusError(412) if "Cup" in ics else None
+    fake_dav.put_error = lambda href, ics: (
+        CalDavStatusError(415, excerpt="Bad SUMMARY:⚽ Emma: Cup") if "Cup" in ics else None
+    )
     await setup_entry(hass, config_entry)
 
     diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, config_entry)
@@ -56,7 +59,7 @@ async def test_diagnostics_contain_counts_and_states_only(
                 "relayed_events": 1,
                 "syncing": False,
                 "last_sync": None,
-                "last_error": "1 event change(s) failed, first error: HTTP 412",
+                "last_error": "1 event change(s) failed, first error: HTTP 415",
             }
         ],
     }

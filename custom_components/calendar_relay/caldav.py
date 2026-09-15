@@ -4,19 +4,23 @@ This module has no Home Assistant imports. It needs an aiohttp ClientSession
 (Home Assistant passes its shared session) and speaks just enough WebDAV and
 CalDAV to discover calendars and to write and delete single event resources.
 
-Error messages never contain URLs, so they are safe to show in entity
-attributes and diagnostics.
+Error messages never contain URLs or credentials. An error raised for an HTTP
+answer that names no DAV:error condition ends with a short excerpt of the answer's
+body (body_excerpt), which can quote event text the server refused; the error's
+summary leaves the excerpt out and is what entity attributes and diagnostics show.
 """
 
 from __future__ import annotations
 
 import base64
+import html
 import ipaddress
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -61,10 +65,111 @@ MAX_REDIRECTS = 5
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 RESOURCE_NAME = re.compile(r"[A-Za-z0-9-]+\.ics")
 DEFAULT_PORTS = {"http": 80, "https": 443}
+EXCERPT_LENGTH = 160
+# The excerpt of a body in which a credential cannot be removed without showing it.
+EXCERPT_WITHHELD = "[withheld, it may contain the credentials]"
+
+# JSON string escapes; an answer may quote the credentials with them.
+_JSON_ESCAPE = re.compile(r'\\(?:u([0-9A-Fa-f]{4})|(["\\/bfnrt]))')
+_JSON_CHARACTERS = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+# A character that continues a word: [redacted] next to one would show which word was removed.
+_WORD_CHARACTER = re.compile(r"[\w-]")
+# A header echoed in a body (an error page that shows the request), up to the end of its line.
+_ECHOED_HEADER = re.compile(r"\b((?:proxy-)?authorization|(?:set-)?cookie)[ \t]*[:=][^\r\n<]*", re.IGNORECASE)
+# Absolute URLs, and absolute paths of two or more segments (iCloud paths carry the account's numeric id).
+_ADDRESS = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']*|(?<![\w.~-])/[^\s<>\"'/]+/[^\s<>\"']*")
+# An XML namespace declaration just before a URL: the namespace names the error format, so it is kept.
+_NAMESPACE_DECLARATION = re.compile(r"xmlns(?::[\w.-]+)?\s*=\s*[\"']$")
+
+
+def body_excerpt(body: bytes, secrets: Iterable[str] = ()) -> str | None:
+    """Return a short excerpt of a response body that is safe to log, or None for an empty body.
+
+    The secrets (credentials) are replaced with [redacted] both before and after HTML character
+    references, JSON string escapes and percent-encoding are decoded, each in the form given and in
+    its decoded form: a password such as ab%41cd echoed raw would otherwise decode to abAcd and slip
+    through. When a secret is part of a longer word, the whole excerpt is EXCERPT_WITHHELD. Echoed
+    Authorization and Cookie headers are then replaced with [redacted], URLs and absolute paths
+    become [url] and [path] (XML namespace names are kept), other characters that do not print
+    become spaces, whitespace is collapsed, and the result is cut to EXCERPT_LENGTH characters.
+    """
+    forms = _secret_forms(secrets)
+    text = _redact_secrets(body.decode("utf-8", errors="replace"), forms)
+    if text is not None:
+        text = _redact_secrets(_decode_escapes(text), forms)
+    if text is None:
+        return EXCERPT_WITHHELD
+    text = _ECHOED_HEADER.sub(r"\1: [redacted]", text)
+    text = "".join(char if char.isprintable() else " " for char in text)
+    text = _ADDRESS.sub(_redact_address, text)
+    text = " ".join(text.split())
+    if len(text) > EXCERPT_LENGTH:
+        text = text[: EXCERPT_LENGTH - 3] + "..."
+    return text or None
+
+
+def _decode_escapes(text: str) -> str:
+    """Return text with HTML character references, JSON string escapes and percent-encoding decoded."""
+    text = html.unescape(text)
+    text = _JSON_ESCAPE.sub(
+        lambda match: chr(int(match.group(1), 16)) if match.group(1) else _JSON_CHARACTERS[match.group(2)], text
+    )
+    text = unquote(text)
+    # Joins the surrogate pairs of \u escapes; a lone surrogate becomes U+FFFD.
+    return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
+def _secret_forms(secrets: Iterable[str]) -> list[str]:
+    """Return every secret as given and as it reads once its own escapes are decoded."""
+    forms: set[str] = set()
+    for secret in secrets:
+        if secret:
+            forms.update((secret, _decode_escapes(secret)))
+    return [form for form in forms if form]
+
+
+def _redact_secrets(text: str, secrets: Iterable[str]) -> str | None:
+    """Return text with every secret, in any case, replaced by [redacted].
+
+    Return None when a secret is part of a longer word (a letter, digit, underscore or hyphen
+    right before or after it): a username such as calendar would show through valid-[redacted]-data.
+    """
+    wanted = sorted({secret for secret in secrets if secret}, key=len, reverse=True)
+    if wanted:
+        pattern = re.compile("|".join(map(re.escape, wanted)), re.IGNORECASE)
+        for match in pattern.finditer(text):
+            around = text[max(0, match.start() - 1) : match.start()] + text[match.end() : match.end() + 1]
+            if _WORD_CHARACTER.search(around):
+                return None
+        text = pattern.sub("[redacted]", text)
+    return text
+
+
+def _redact_address(match: re.Match[str]) -> str:
+    """Return the replacement of a URL or path, or the URL itself when it names an XML namespace."""
+    if _NAMESPACE_DECLARATION.search(match.string, max(0, match.start() - 64), match.start()):
+        return match.group()
+    return "[url]" if "://" in match.group() else "[path]"
 
 
 class CalDavError(Exception):
-    """Base class for CalDAV errors."""
+    """Base class for CalDAV errors.
+
+    The message may end with an excerpt of the server's answer, which can quote event text.
+    summary is the message without it: use it for text that is kept or shown, such as entity
+    attributes and diagnostics.
+
+    resource_deleted is True when async_put_event deleted the event resource to write it again
+    (after a 412), or may have (the DELETE got no usable answer), and the write did not follow:
+    the resource may be gone, whatever the caller last wrote to it.
+    """
+
+    def __init__(self, message: str, excerpt: str | None = None) -> None:
+        """Store the message and the excerpt of the answer, if any."""
+        super().__init__(f"{message}, response body: {excerpt}" if excerpt else message)
+        self.summary = message
+        self.excerpt = excerpt
+        self.resource_deleted = False
 
 
 class CalDavConnectionError(CalDavError):
@@ -74,12 +179,12 @@ class CalDavConnectionError(CalDavError):
 class CalDavStatusError(CalDavError):
     """The server answered with a status the client cannot use."""
 
-    def __init__(self, status: int, condition: str | None = None) -> None:
-        """Store the status and the DAV:error precondition, if any."""
+    def __init__(self, status: int, condition: str | None = None, excerpt: str | None = None) -> None:
+        """Store the status, the DAV:error precondition and the excerpt of the answer, if any."""
         message = f"HTTP {status}"
         if condition:
             message = f"{message} ({condition})"
-        super().__init__(message)
+        super().__init__(message, excerpt)
         self.status = status
         self.condition = condition
 
@@ -264,6 +369,8 @@ class CalDavClient:
         # Built by hand: aiohttp 3.14 deprecates BasicAuth, and encode_basic_auth is missing before 3.14.
         token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
         self._authorization = f"Basic {token}"
+        # Removed from excerpts of response bodies, in case a server echoes them.
+        self._secrets = (username, quote(username, safe=""), password, token.rstrip("="))
 
     @property
     def url(self) -> str:
@@ -348,11 +455,15 @@ class CalDavClient:
                     raise CalDavError("Refusing to follow a redirect away from the event resource")
                 continue
             if status == 401:
-                raise CalDavAuthError(status)
+                raise CalDavAuthError(status, excerpt=self._excerpt(payload))
             if status == 429 or status >= 500:
-                raise CalDavConnectionError(f"{method} returned HTTP {status}")
+                raise CalDavConnectionError(f"{method} returned HTTP {status}", self._excerpt(payload))
             return _Response(status=status, url=url, body=payload)
         raise CalDavError("Too many redirects")
+
+    def _excerpt(self, body: bytes) -> str | None:
+        """Return a safe excerpt of a response body, without this client's credentials."""
+        return body_excerpt(body, self._secrets)
 
     async def _async_propfind(self, url: str, body: str, *, depth: int) -> _Response:
         """Send a PROPFIND."""
@@ -404,7 +515,7 @@ class CalDavClient:
         if not homes and principal:
             response = await self._async_propfind(principal, PROPFIND_HOME, depth=0)
             if response.status == 403:
-                raise CalDavAuthError(403)
+                raise CalDavAuthError(403, excerpt=self._excerpt(response.body))
             if response.status == 207:
                 for resource in _parse_multistatus(response.body, response.url):
                     homes.extend(resource.hrefs(CALDAV_HOME_SET))
@@ -416,9 +527,9 @@ class CalDavClient:
         """List the calendar collections directly inside a calendar home."""
         response = await self._async_propfind(home, PROPFIND_CALENDARS, depth=1)
         if response.status == 403:
-            raise CalDavAuthError(403)
+            raise CalDavAuthError(403, excerpt=self._excerpt(response.body))
         if response.status != 207:
-            raise CalDavStatusError(response.status)
+            raise CalDavStatusError(response.status, excerpt=self._excerpt(response.body))
         calendars: list[DavCalendar] = []
         for resource in _parse_multistatus(response.body, response.url):
             resourcetype = resource.props.get(DAV_RESOURCETYPE)
@@ -455,27 +566,51 @@ class CalDavClient:
         The URL returned is the one inside calendar_url, also when the server
         redirected the write (to an iCloud partition host, say): a later DELETE of
         it passes is_event_href and follows the same redirect.
+
+        iCloud answers a plain PUT to an entry that was opened on an Apple device
+        with 412 and no DAV:error condition, while a DELETE of it works. So a 412 is
+        answered by deleting the resource (already gone is fine) and writing it once
+        more; the answer to that second PUT succeeds or raises like a first one. An
+        error raised after the resource was, or may have been, deleted has
+        resource_deleted set.
         """
         if RESOURCE_NAME.fullmatch(name) is None:
             raise ValueError("Resource names must be letters, digits and hyphens ending in .ics")
         href = collection_url(calendar_url) + name
-        response = await self._request(
-            "PUT",
-            href,
-            headers={"Content-Type": ICS_CONTENT_TYPE},
-            body=ics.encode("utf-8"),
-            resource=True,
-        )
+        body = ics.encode("utf-8")
+        response = await self._async_put(href, body)
+        if response.status != 412:
+            return self._put_result(href, response)
+        _LOGGER.debug("An event resource refused to be replaced (HTTP 412); deleting it and writing it again")
+        try:
+            await self.async_delete_event(calendar_url, href)
+        except CalDavConnectionError as err:
+            # No answer, or a server error: the DELETE may have been carried out.
+            err.resource_deleted = True
+            raise
+        try:
+            return self._put_result(href, await self._async_put(href, body))
+        except CalDavError as err:
+            err.resource_deleted = True
+            raise
+
+    def _put_result(self, href: str, response: _Response) -> str:
+        """Return href for a successful PUT, or raise the error its answer maps to."""
         if response.status in (200, 201, 204):
             return href
         condition = _error_condition(response.body)
+        excerpt = None if condition else self._excerpt(response.body)
         if response.status in (403, 409) and condition:
             raise CalDavRefusedError(response.status, condition)
         if response.status == 403:
-            raise CalDavAuthError(response.status)
+            raise CalDavAuthError(response.status, excerpt=excerpt)
         if response.status in (404, 409):
-            raise CalDavNotFoundError(response.status)
-        raise CalDavStatusError(response.status, condition)
+            raise CalDavNotFoundError(response.status, excerpt=excerpt)
+        raise CalDavStatusError(response.status, condition, excerpt)
+
+    async def _async_put(self, href: str, body: bytes) -> _Response:
+        """Send a PUT of iCalendar data to an event resource."""
+        return await self._request("PUT", href, headers={"Content-Type": ICS_CONTENT_TYPE}, body=body, resource=True)
 
     async def async_delete_event(self, calendar_url: str, href: str) -> bool:
         """Delete an event resource. Return False if it was already gone (404 or 410)."""
@@ -488,8 +623,9 @@ class CalDavClient:
         if response.status in (404, 410):
             return False
         condition = _error_condition(response.body)
+        excerpt = None if condition else self._excerpt(response.body)
         if response.status in (403, 409) and condition:
             raise CalDavRefusedError(response.status, condition)
         if response.status == 403:
-            raise CalDavAuthError(response.status)
-        raise CalDavStatusError(response.status, condition)
+            raise CalDavAuthError(response.status, excerpt=excerpt)
+        raise CalDavStatusError(response.status, condition, excerpt)

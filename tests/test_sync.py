@@ -36,6 +36,7 @@ from .conftest import (
     WORK_URL,
     FakeCalendar,
     FakeDav,
+    FakeWaze,
     make_entry,
     relay_data,
     relay_subentry,
@@ -427,7 +428,7 @@ async def test_auth_error_starts_reauth(
 ) -> None:
     """401 and 403 while syncing start the reauth flow for the account."""
     source_calendar.events = [call_up()]
-    fake_dav.put_error = CalDavAuthError(status)
+    fake_dav.put_error = CalDavAuthError(status, excerpt="Unauthorized")
     await setup_entry(hass, config_entry)
 
     flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
@@ -448,7 +449,7 @@ async def test_missing_target_creates_repair_issue_until_next_success(
 ) -> None:
     """A missing target calendar raises a repair issue that goes away after a successful sync."""
     source_calendar.events = [call_up()]
-    fake_dav.put_error = CalDavNotFoundError(status)
+    fake_dav.put_error = CalDavNotFoundError(status, excerpt="Not Found")
     await setup_entry(hass, config_entry)
 
     issue = issue_registry.async_get_issue(DOMAIN, f"target_missing_{RELAY_ID}")
@@ -471,14 +472,16 @@ async def test_connection_error_is_retried_on_the_next_pass(
     hass_storage: dict,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Other failures log a warning and the next pass tries again."""
+    """Other failures log a warning with the server's answer and the next pass tries again."""
     source_calendar.events = [call_up()]
-    fake_dav.put_error = CalDavConnectionError("PUT returned HTTP 503")
+    fake_dav.put_error = CalDavConnectionError("PUT returned HTTP 503", "Service Unavailable")
     await setup_entry(hass, config_entry)
 
     assert STORE_KEY not in hass_storage
     assert relay_of(config_entry).last_error == "PUT returned HTTP 503"
-    assert "sync failed, retrying on the next pass" in caplog.text
+    assert "sync failed, retrying on the next pass: PUT returned HTTP 503, response body: Service Unavailable" in (
+        caplog.text
+    )
 
     fake_dav.put_error = None
     await relay_of(config_entry).async_sync()
@@ -511,7 +514,7 @@ async def test_rejected_delete_is_retried(
     await setup_entry(hass, config_entry)
     source_calendar.events = [timed("Training", KICKOFF, uid="training")]
 
-    fake_dav.delete_error = CalDavStatusError(400)
+    fake_dav.delete_error = CalDavStatusError(400, excerpt="Bad Request")
     await relay_of(config_entry).async_sync()
     assert len(stored(hass_storage)) == 1
     assert relay_of(config_entry).last_error == "1 event change(s) failed, first error: HTTP 400"
@@ -754,6 +757,203 @@ async def test_redirected_write_is_later_deleted_through_the_same_redirect(
     assert relay_of(config_entry).last_error is None
 
 
+@pytest.mark.parametrize("gone_before_delete", [False, True])
+async def test_entry_opened_on_an_apple_device_is_deleted_and_written_again(
+    hass: HomeAssistant,
+    source_calendar: FakeCalendar,
+    dav_server: FakeDav,
+    waze: FakeWaze,
+    hass_storage: dict,
+    gone_before_delete: bool,
+) -> None:
+    """iCloud answers a PUT to an entry opened on an iPhone with 412, so a moved match is deleted and written again.
+
+    That is one write: the store holds the new start, the event keeps its travel time and alert, Waze is not asked
+    and its state is kept, and the next pass has nothing to do. An entry already gone when the DELETE arrives (404)
+    is written again too.
+    """
+    event = call_up(location="Pitch 2")
+    source_calendar.events = [event]
+    entry = make_entry(relay_subentry(travel_time="waze", leave_reminder=True))
+    await setup_entry(hass, entry)
+    [href] = dav_server.puts()
+    travel = hass_storage[STORE_KEY]["data"]["travel"]
+    assert len(waze.calls) == 1
+
+    dav_server.opened.add(href)
+    if gone_before_delete:
+        del dav_server.resources[href]
+    source_calendar.events = [call_up(KICKOFF + timedelta(hours=3), location="Pitch 2")]
+    dav_server.calls.clear()
+    relay = relay_of(entry)
+    await relay.async_sync()
+
+    assert dav_server.calls == [("PUT", href), ("DELETE", href), ("PUT", href)]
+    body = dav_server.resources[href]
+    assert "DTSTART;TZID=Europe/Copenhagen:20260920T150000\r\n" in body
+    assert "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT25M\r\n" in body
+    assert "BEGIN:VALARM\r\n" in body
+    record = stored(hass_storage)[event_key(event)]
+    assert (record["href"], record["start"], record["target"]) == (href, "2026-09-20T13:00:00+00:00", FAMILY_URL)
+    assert hass_storage[STORE_KEY]["data"]["travel"] == travel
+    assert len(waze.calls) == 1
+    assert relay.last_error is None
+
+    dav_server.calls.clear()
+    await relay.async_sync()
+    assert dav_server.calls == []
+
+
+async def test_entry_refused_again_after_the_delete_fails_that_event_only(
+    hass: HomeAssistant,
+    source_calendar: FakeCalendar,
+    dav_server: FakeDav,
+    config_entry: MockConfigEntry,
+    hass_storage: dict,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A second 412 is not retried: the event fails with the status alone in last_error and an excerpt of the answer
+    in the warning, the rest of the pass goes on, the record's hash is cleared because the entry is gone, and the next
+    pass writes the event into the freed resource."""
+    source_calendar.events = [
+        call_up(uid="a"),
+        call_up(KICKOFF + timedelta(days=1), uid="b"),
+        call_up(KICKOFF + timedelta(days=2), uid="c"),
+    ]
+    await setup_entry(hass, config_entry)
+    a_href, b_href, c_href = dav_server.puts()
+    a_key = event_key(call_up(uid="a"))
+    a_record = dict(stored(hass_storage)[a_key])
+
+    dav_server.opened.add(a_href)
+    dav_server.failing[a_href] = 412
+    dav_server.refusal_body = "<html>\n  <body>Precondition\tFailed</body>\n</html>"
+    source_calendar.events = [
+        call_up(uid="a", location="Pitch 2"),
+        call_up(KICKOFF + timedelta(days=1), uid="b", location="Pitch 3"),
+        timed("Home - Away", KICKOFF + timedelta(days=2), uid="c"),
+    ]
+    dav_server.calls.clear()
+    relay = relay_of(config_entry)
+    await relay.async_sync()
+
+    assert dav_server.calls == [
+        ("PUT", a_href),
+        ("DELETE", a_href),
+        ("PUT", a_href),
+        ("PUT", b_href),
+        ("DELETE", c_href),
+    ]
+    assert set(dav_server.resources) == {b_href}
+    assert "LOCATION:Pitch 3\r\n" in dav_server.resources[b_href]
+    assert stored(hass_storage)[a_key] == {**a_record, "hash": ""}
+    assert len(stored(hass_storage)) == 2
+    assert relay.last_error == "1 event change(s) failed, first error: HTTP 412"
+    assert (
+        "writing an event failed, retrying on the next pass: "
+        "HTTP 412, response body: <html> <body>Precondition Failed</body> </html>"
+    ) in caplog.text
+
+    dav_server.failing.clear()
+    dav_server.calls.clear()
+    await relay.async_sync()
+    assert dav_server.calls == [("PUT", a_href)]
+    assert "LOCATION:Pitch 2\r\n" in dav_server.resources[a_href]
+    assert relay.last_error is None
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "pass_goes_on"),
+    [
+        (412, "1 event change(s) failed, first error: HTTP 412", True),
+        (503, "PUT returned HTTP 503", False),
+        (403, "Authentication failed (HTTP 403)", False),
+        (404, "Target calendar not found (HTTP 404)", False),
+    ],
+)
+async def test_entry_deleted_by_a_failed_rewrite_is_written_even_when_its_source_moves_back(
+    hass: HomeAssistant,
+    source_calendar: FakeCalendar,
+    dav_server: FakeDav,
+    config_entry: MockConfigEntry,
+    hass_storage: dict,
+    issue_registry: ir.IssueRegistry,
+    status: int,
+    error: str,
+    pass_goes_on: bool,
+) -> None:
+    """When the write after the delete fails, the entry is gone and the record's hash is cleared, so the next pass
+    writes it, also after the match moved back to the time the entry had. The failure is handled like any failed
+    write: a refused event fails alone, while a server error, a bare 403 (reauthentication) and a 404 (repair issue)
+    end the pass before the other events."""
+    a, b = call_up(uid="a"), call_up(KICKOFF + timedelta(days=1), uid="b")
+    source_calendar.events = [a, b]
+    await setup_entry(hass, config_entry)
+    a_href, b_href = dav_server.puts()
+    a_record = dict(stored(hass_storage)[event_key(a)])
+    moved_b = call_up(KICKOFF + timedelta(days=1), uid="b", location="Pitch 2")
+
+    dav_server.opened.add(a_href)
+    dav_server.failing[a_href] = status
+    source_calendar.events = [call_up(KICKOFF + timedelta(hours=3), uid="a"), moved_b]
+    dav_server.calls.clear()
+    relay = relay_of(config_entry)
+    await relay.async_sync()
+
+    assert dav_server.calls == [("PUT", a_href), ("DELETE", a_href), ("PUT", a_href)] + [("PUT", b_href)] * pass_goes_on
+    assert a_href not in dav_server.resources
+    assert stored(hass_storage)[event_key(a)] == {**a_record, "hash": ""}
+    assert relay.last_error == error
+    flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert [flow["context"]["source"] for flow in flows] == (["reauth"] if status == 403 else [])
+    assert (issue_registry.async_get_issue(DOMAIN, f"target_missing_{RELAY_ID}") is not None) is (status == 404)
+
+    dav_server.failing.clear()
+    source_calendar.events = [a, moved_b]
+    dav_server.calls.clear()
+    await relay.async_sync()
+
+    assert dav_server.calls == [("PUT", a_href)] + [("PUT", b_href)] * (not pass_goes_on)
+    assert "DTSTART;TZID=Europe/Copenhagen:20260920T120000\r\n" in dav_server.resources[a_href]
+    assert "LOCATION:Pitch 2\r\n" in dav_server.resources[b_href]
+    assert stored(hass_storage)[event_key(a)] == a_record
+    assert relay.last_error is None
+    assert issue_registry.async_get_issue(DOMAIN, f"target_missing_{RELAY_ID}") is None
+
+    dav_server.calls.clear()
+    await relay.async_sync()
+    assert dav_server.calls == []
+
+
+async def test_updates_and_entries_deleted_by_hand_never_delete(
+    hass: HomeAssistant, source_calendar: FakeCalendar, dav_server: FakeDav, config_entry: MockConfigEntry
+) -> None:
+    """Without a 412 a change is one PUT. An entry deleted by hand stays deleted until its source changes, and is then
+    created with 201, which never reaches the delete and write again."""
+    source_calendar.events = [call_up(uid="a"), call_up(KICKOFF + timedelta(days=1), uid="b")]
+    await setup_entry(hass, config_entry)
+    a_href, b_href = dav_server.puts()
+    del dav_server.resources[b_href]
+    dav_server.calls.clear()
+    relay = relay_of(config_entry)
+
+    source_calendar.events = [
+        call_up(KICKOFF + timedelta(hours=3), uid="a"),
+        call_up(KICKOFF + timedelta(days=1), uid="b"),
+    ]
+    await relay.async_sync()
+    assert dav_server.calls == [("PUT", a_href)]
+    assert "DTSTART;TZID=Europe/Copenhagen:20260920T150000\r\n" in dav_server.resources[a_href]
+    assert b_href not in dav_server.resources
+
+    source_calendar.events[1] = call_up(KICKOFF + timedelta(days=1), uid="b", location="Pitch 2")
+    dav_server.calls.clear()
+    await relay.async_sync()
+    assert dav_server.calls == [("PUT", b_href)]
+    assert "LOCATION:Pitch 2\r\n" in dav_server.resources[b_href]
+    assert relay.last_error is None
+
+
 async def test_text_with_lone_surrogates_is_relayed(
     hass: HomeAssistant,
     source_calendar: FakeCalendar,
@@ -850,16 +1050,42 @@ async def test_forbidden_target_that_is_not_on_the_account_is_a_repair_issue(
     source_calendar: FakeCalendar,
     fake_dav: FakeDav,
     issue_registry: ir.IssueRegistry,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """After the account moved to another user, a 403 from the old user's calendar raises a repair, not reauth."""
     source_calendar.events = [call_up()]
-    fake_dav.put_error = CalDavAuthError(403)
+    fake_dav.put_error = CalDavAuthError(403, excerpt="Forbidden")
     entry = make_entry(relay_subentry(target_calendar=OLD_ACCOUNT_URL))
     await setup_entry(hass, entry)
 
     assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []
     assert issue_registry.async_get_issue(DOMAIN, f"target_missing_{RELAY_ID}") is not None
     assert relay_of(entry).last_error == "Target calendar not found (HTTP 403)"
+    assert "the target calendar does not exist (HTTP 403, response body: Forbidden)" in caplog.text
+
+
+async def test_forbidden_target_still_clears_the_hash_of_an_entry_deleted_to_write_it_again(
+    hass: HomeAssistant,
+    source_calendar: FakeCalendar,
+    fake_dav: FakeDav,
+    issue_registry: ir.IssueRegistry,
+    hass_storage: dict,
+) -> None:
+    """A 403 turned into a missing calendar still says the entry was deleted to write it again, so its hash is
+    cleared and the entry is written once the calendar can be reached."""
+    source_calendar.events = [call_up()]
+    entry = make_entry(relay_subentry(target_calendar=OLD_ACCOUNT_URL))
+    await setup_entry(hass, entry)
+    record = dict(stored(hass_storage)[event_key(call_up())])
+
+    error = CalDavAuthError(403)
+    error.resource_deleted = True
+    fake_dav.put_error = error
+    source_calendar.events = [call_up(KICKOFF + timedelta(hours=3))]
+    await relay_of(entry).async_sync()
+
+    assert issue_registry.async_get_issue(DOMAIN, f"target_missing_{RELAY_ID}") is not None
+    assert stored(hass_storage)[event_key(call_up())] == {**record, "hash": ""}
 
 
 async def test_empty_read_waits_for_confirmation_before_deleting(
@@ -957,7 +1183,9 @@ async def test_new_calendar_refusing_events_keeps_them_in_the_old_calendar(
     await setup_entry(hass, config_entry)
     old_hrefs = fake_dav.puts()
     new_hrefs = [href.replace(FAMILY_URL, WORK_URL) for href in old_hrefs]
-    fake_dav.put_error = lambda href, ics: CalDavStatusError(415) if href.startswith(WORK_URL) else None
+    fake_dav.put_error = lambda href, ics: (
+        CalDavStatusError(415, excerpt="Unsupported") if href.startswith(WORK_URL) else None
+    )
     fake_dav.calls.clear()
 
     hass.config_entries.async_update_subentry(
