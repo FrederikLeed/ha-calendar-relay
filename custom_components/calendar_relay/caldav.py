@@ -158,10 +158,6 @@ class CalDavError(Exception):
     The message may end with an excerpt of the server's answer, which can quote event text.
     summary is the message without it: use it for text that is kept or shown, such as entity
     attributes and diagnostics.
-
-    resource_deleted is True when async_put_event deleted the event resource to write it again
-    (after a 412), or may have (the DELETE got no usable answer), and the write did not follow:
-    the resource may be gone, whatever the caller last wrote to it.
     """
 
     def __init__(self, message: str, excerpt: str | None = None) -> None:
@@ -169,7 +165,6 @@ class CalDavError(Exception):
         super().__init__(f"{message}, response body: {excerpt}" if excerpt else message)
         self.summary = message
         self.excerpt = excerpt
-        self.resource_deleted = False
 
 
 class CalDavConnectionError(CalDavError):
@@ -567,35 +562,18 @@ class CalDavClient:
         redirected the write (to an iCloud partition host, say): a later DELETE of
         it passes is_event_href and follows the same redirect.
 
-        iCloud answers a plain PUT to an entry that was opened on an Apple device
-        with 412 and no DAV:error condition, while a DELETE of it works. So a 412 is
-        answered by deleting the resource (already gone is fine) and writing it once
-        more; the answer to that second PUT succeeds or raises like a first one. An
-        error raised after the resource was, or may have been, deleted has
-        resource_deleted set.
+        One PUT is sent, without If-Match or If-None-Match. iCloud answers it with 412
+        and no DAV:error condition for an entry that was opened on an Apple device,
+        and for a resource name or UID that was deleted; writing the same name again
+        does not help there, so the 412 is raised as CalDavStatusError for the caller,
+        which can write the event under another name and UID.
         """
         if RESOURCE_NAME.fullmatch(name) is None:
             raise ValueError("Resource names must be letters, digits and hyphens ending in .ics")
         href = collection_url(calendar_url) + name
-        body = ics.encode("utf-8")
-        response = await self._async_put(href, body)
-        if response.status != 412:
-            return self._put_result(href, response)
-        _LOGGER.debug("An event resource refused to be replaced (HTTP 412); deleting it and writing it again")
-        try:
-            await self.async_delete_event(calendar_url, href)
-        except CalDavConnectionError as err:
-            # No answer, or a server error: the DELETE may have been carried out.
-            err.resource_deleted = True
-            raise
-        try:
-            return self._put_result(href, await self._async_put(href, body))
-        except CalDavError as err:
-            err.resource_deleted = True
-            raise
-
-    def _put_result(self, href: str, response: _Response) -> str:
-        """Return href for a successful PUT, or raise the error its answer maps to."""
+        response = await self._request(
+            "PUT", href, headers={"Content-Type": ICS_CONTENT_TYPE}, body=ics.encode("utf-8"), resource=True
+        )
         if response.status in (200, 201, 204):
             return href
         condition = _error_condition(response.body)
@@ -607,10 +585,6 @@ class CalDavClient:
         if response.status in (404, 409):
             raise CalDavNotFoundError(response.status, excerpt=excerpt)
         raise CalDavStatusError(response.status, condition, excerpt)
-
-    async def _async_put(self, href: str, body: bytes) -> _Response:
-        """Send a PUT of iCalendar data to an event resource."""
-        return await self._request("PUT", href, headers={"Content-Type": ICS_CONTENT_TYPE}, body=body, resource=True)
 
     async def async_delete_event(self, calendar_url: str, href: str) -> bool:
         """Delete an event resource. Return False if it was already gone (404 or 410)."""

@@ -277,7 +277,9 @@ written without alerts.
   entity directly, because the `calendar.get_events` action leaves out the event's unique id.
 - **Identity**: a source event is identified by its uid (plus its recurrence id for a recurring event).
   Each relayed event gets its own resource `relay-<id>.ics` and UID `<id>@calendar-relay`, so a changed
-  event is replaced in place.
+  event is replaced in place. When the server will not take the event under that name again (see
+  [Limits](#limits)), it is written as `relay-<id>-<token>.ics` with UID `<id>-<token>@calendar-relay`, with a
+  short random token, and keeps that name from then on.
 - **What is written**: the title (filtered and prefixed), start and end, description and location, and
   with the settings above Apple's structured location, the leave line, Apple's travel duration and an
   alert. No organizer or attendees are written, so nobody gets an invitation.
@@ -289,8 +291,9 @@ written without alerts.
   first. Changing Home Assistant's time zone rewrites each timed event once. In a zone whose clock changes
   follow no yearly rule, such as Morocco's, the changes of the current year and the next two are written
   instead, so its timed events are rewritten once at the start of each year.
-- **Sync state**: what was written where is kept in Home Assistant's storage
-  (`.storage/calendar_relay.<relay id>`), so nothing is rewritten after a restart. Waze travel times are
+- **Sync state**: what was written where, under which name, is kept in Home Assistant's storage
+  (`.storage/calendar_relay.<relay id>`), so nothing is rewritten after a restart. So are old entries of an
+  event that still have to be deleted. Waze travel times are
   kept there too: the minutes, when they were computed, whether with live traffic, the event start they
   were computed for, and hashes of what they were computed for instead of the addresses; so is when an
   event whose travel time failed is asked again, and why it failed.
@@ -312,11 +315,16 @@ written without alerts.
 - The server refuses one event with a reason (403 or 409 with a CalDAV precondition, such as a UID that
   already exists in another calendar): only that event fails, the rest of the sync goes on, and the next
   sync tries it again.
-- The server will not replace an event and answers 412 (iCloud does this for an entry someone opened on an
-  Apple device): the relay deletes the entry and writes it again, once. If writing it again fails, the entry
-  is missing until a later sync writes it, and the failure is handled like any other failed write: a refused
-  event fails alone, a bare 403 starts reauthentication, a missing calendar raises the repair issue, and a
-  timeout or server error waits for the next sync.
+- The server will not write an event under its name and answers 412 (iCloud does this for an entry someone
+  opened on an Apple device, and for an entry that was deleted): the relay writes the event once under a new
+  name, then deletes the old entry. Old entries are deleted after the other changes of a sync, so one that
+  cannot be deleted holds nothing else back; later syncs try again as long as the event is relayed, and the
+  event shows twice until then. If the new name is refused too, the old entry is left as it was and the next
+  sync tries again with another new name. If the new name gets no answer (a timeout or server error), the
+  entry may exist anyway, so the relay keeps that name and the next sync writes it again, and no second copy
+  is left behind. The failure is handled like any other failed write: a refused event fails alone, a bare 403
+  starts reauthentication, a missing calendar raises the repair issue, and a timeout or server error waits for
+  the next sync.
 - Waze Travel Time is missing or fails: events keep their last travel time, and `last_error` starts with
   `Travel time:` and says why. See [Travel time](#travel-time).
 - Anything else (timeouts, rate limits, server errors): a warning in the log, and the next sync tries again.
@@ -333,13 +341,15 @@ part of a longer word in the answer, nothing of the answer is quoted. The answer
   time changes (including the live traffic update in the hours before it starts), and when a setting that
   shapes it changes, such as the title prefix or Home Assistant's time zone.
 - An event you delete by hand from the target calendar is not recreated until the relay rewrites it.
-- On iCloud, an entry someone has opened on an Apple device cannot be replaced in place, so every rewrite
-  deletes the entry and writes it again. Devices may show it as a new event, and alerts added by hand on it
-  are lost; with Waze Travel Time this can happen shortly before a match, when live traffic changes the
-  travel time. If writing it again fails, the entry is missing until a later sync writes it, also when the
-  source event has changed back in the meantime; an event that is over by then stays missing. An entry
-  that has already started when it is written again gets no leave line or leave reminder, like any
-  rewritten event that has started.
+- On iCloud, an entry someone has opened on an Apple device, or one that was deleted (by hand, or by the
+  relay when its call-up was withdrawn), cannot be written again under the same name. So the relay writes it
+  under a new name and then deletes the old entry. Devices show it as a new event, alerts added by hand on it
+  are lost, and a duplicate can show briefly until the old entry is deleted. With Waze Travel Time this can
+  happen shortly before a match, when live traffic changes the travel time. If the new name cannot be
+  written either, a later sync tries again, also when the source event has changed back in the meantime;
+  until then an opened entry keeps its old content and an entry deleted on a device stays missing, and an
+  event that is over by then is not written again. An entry that has already started when it is written
+  again gets no leave line or leave reminder, like any rewritten event that has started.
 - A withdrawn event is deleted only if it has not started yet. Running and past events stay in the target
   calendar.
 - Removing a relay, or the whole account, leaves its events in the target calendar. To remove them first,
@@ -347,8 +357,10 @@ part of a longer word in the answer, nothing of the answer is quoted. The answer
   Events that have already started stay.
 - Changing a relay's target calendar moves its future events: they are deleted from the old calendar and
   written to the new one. If the new calendar refuses an event, it is put back into the old calendar and
-  stays there until it changes or Home Assistant restarts. Copies the relay can no longer reach (a server
-  address or account that changed) stay in the old calendar.
+  stays there until it changes or Home Assistant restarts. If the new calendar does not answer, the event is
+  put back too and the next sync moves it again; a copy the new calendar may have written anyway is deleted
+  once the move succeeds. Copies the relay can no longer reach (a server address or account that changed)
+  stay in the old calendar.
 - Recurring events are relayed as separate single events, one per occurrence inside the look-ahead.
 - Source events without a uid are identified by title and start time, so moving or renaming one shows up
   as a delete and a new event. Once the event has started the old copy is kept, so a running event moved

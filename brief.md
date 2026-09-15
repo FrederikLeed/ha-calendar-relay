@@ -1,7 +1,7 @@
 ---
 project: ha-calendar-relay
 repo: https://github.com/FrederikLeed/ha-calendar-relay
-updated: 2026-09-15
+updated: 2026-09-16
 status: active
 ---
 
@@ -42,10 +42,24 @@ with a per-child prefix, plus the match's place and when to leave.
   back; the excerpt decodes HTML, JSON and percent escapes before removing credentials and is withheld when
   a credential sits inside a longer word; README and this brief say delete and recreate happens on any
   rewrite (source, travel time including live traffic, settings) and how a failed second write is handled.
+- v0.2.3 released 2026-09-16 (tests and local hassfest; no CI). Live
+  findings on iCloud (2026-09-15/16, through Home Assistant against a real calendar): a plain PUT to an
+  entry the relay wrote and someone then opened on an iPhone returns 412 with an empty body; updates of
+  entries no phone opened work (also adding VALARM and X-APPLE-TRAVEL-DURATION), and so do creates under a
+  name and UID never used before; DELETE of the opened entry returns 204; after that DELETE, creating the
+  same event again (same `relay-<hex>.ics` and UID `<hex>@calendar-relay`) returns 412 again, also through
+  0.2.2's delete-and-retry. So iCloud keeps the name or the UID blocked (which one is not known), and 0.2.2
+  deleted a rescheduled opened entry and then failed to write it, and a call-up withdrawn and reinstated
+  could never be written. Decision: a generation token per relayed event; on a 412 the event is written
+  once under a fresh name and UID and the old entry is deleted afterwards (see Decisions). 0.2.2's
+  delete-and-retry and `CalDavError.resource_deleted` are removed.
 - No GitHub Actions (owner's choice): lint, tests and the Home Assistant validations are run locally
   before each release. The one CI run before the workflows were removed was green (lint, tests, hassfest,
   HACS validation).
-- Tests: 527 passing, 99% coverage (relay, ics, location and config flow at 100%), including regression
+- Tests: 572 passing, 99% coverage (relay, ics, location and config flow at 100%), including 0.2.3
+  tests for the 412 path against a FakeDav server that blocks names and UIDs (plus review regressions:
+  withdrawal with a failing old DELETE then reinstated, fresh PUT without answer or cancelled mid-PUT,
+  a stuck 5xx on an old DELETE, a move whose new-calendar PUT got no answer), and regression
   tests for the adversarial review of 0.2.0 (Waze starvation, overflow, churn after a home change, shared
   Waze queue, started events, 0,0, Google links, parameter decoding) and for 0.2.1 (Copenhagen summer,
   winter and DST changes, Tokyo, Sydney, the UTC fallback, the one-time upgrade rewrite, arrive early in
@@ -73,7 +87,8 @@ with a per-child prefix, plus the match's place and when to leave.
 - `relay.py` reads the entity object's `async_get_events` (the service drops uid), plans the wanted
   events, asks Waze where needed, PUTs new or changed ones, DELETEs withdrawn future ones, forgets started
   ones. State per relay in `Store` (`calendar_relay.<subentry_id>`): `events` maps key to href, content
-  hash, start, end, target URL; `travel` maps key to Waze minutes, a fingerprint hash of origin,
+  hash, start, end, target URL, plus `token` and `pending` (hrefs of old entries still to delete) only
+  when not empty; `travel` maps key to Waze minutes, a fingerprint hash of origin,
   destination and region, a place hash of the destination alone, computed_at, a realtime flag and the
   event start it was computed for; `travel_retry` maps key to the failing fingerprint, failures in a row,
   retry_at and the error text.
@@ -82,7 +97,8 @@ with a per-child prefix, plus the match's place and when to leave.
   `@lat,lon`), OpenStreetMap (`mlat`/`mlon`); the first valid one wins. `ics.py` renders the Apple
   properties with a DQUOTE parameter helper, and timed events in the time zone the relay passes
   (`hass.config.time_zone`) with a yearly-rule VTIMEZONE derived from zoneinfo (no new requirements).
-- Resource name `relay-<sha256(subentry_id + key)[:32]>.ics`, UID `<same>@calendar-relay`.
+- Resource name `relay-<sha256(subentry_id + key)[:32]>.ics`, UID `<same>@calendar-relay`; with a
+  generation token (0.2.3) `relay-<hex>-<token>.ics` and `<hex>-<token>@calendar-relay`.
 - Triggers: `async_at_started`, source state change (Debouncer 30 s), 15 min interval, Sync now button.
 
 ## Decisions and gotchas
@@ -94,21 +110,46 @@ with a per-child prefix, plus the match's place and when to leave.
   calendars of the same home (403 `unique-scheduling-object-resource`). If the new calendar refuses the
   event, the copy is put back into the old calendar and the move is not retried until the event changes
   or the relay reloads. Old copies that cannot be deleted (untrusted host, other account) are left behind.
+  Since 0.2.3 a move deletes the record's pending hrefs first, keeps the token in the new calendar, and
+  both the write to the new calendar and the put-back use a fresh identity after a 412 (iCloud blocks the
+  name just deleted).
 - Every PUT and DELETE targets a relay-style `.ics` directly inside the calendar; redirects are only
   followed when they keep the same resource name (a DELETE on a shared iCloud calendar collection would
   unlink it). The stored href is the one inside the target, not the redirected URL.
 - Error mapping during sync: 401 and a bare 403 start reauth; 403 or 409 with a DAV:error precondition
   fail that event only (CalendarServer 403, Radicale 409 `no-uid-conflict`); 404, a bare 409, or a bare
-  403 from a calendar the account does not list raise the target-missing repair issue. A PUT answered 412
-  is replaced by DELETE and one more PUT (0.2.2), on any rewrite of an opened entry: a changed source, a new
-  travel time (also the live traffic update shortly before a match) or changed settings, so devices may
-  show it as new. If the second PUT fails, or the DELETE gets no usable answer (timeout, 429, 5xx), the
-  client sets `resource_deleted` on the error (kept when a foreign 403 becomes a missing calendar) and the
-  relay clears the record's hash, keeping href, start, end and target, so the next pass writes the event
-  whatever it holds (review finding: with the old hash kept, a match moved back to its first time was never
-  written again). The failure itself maps like any PUT: a second 412, 400 or refused event fails alone; a
-  bare 403, 404/409, 429/5xx end the pass. An event that is over before a pass succeeds stays missing: the
-  source no longer returns it.
+  403 from a calendar the account does not list raise the target-missing repair issue.
+- 412 and generation tokens (0.2.3): the client sends one PUT and raises 412 as `CalDavStatusError`. The
+  relay then draws a token (`secrets.token_hex(4)`, never the current one) and PUTs once under the fresh
+  name and UID, never more per event per pass. New events (also a reinstated call-up) try the base name
+  first. The content hash is computed without the token, so a re-identified event and every 0.2.2 record
+  keep their hash. On success the record gets the new href and `token`, and the old href goes to `pending`.
+  Pending hrefs are deleted in their own phase after all writes and removals of the pass (review finding:
+  deleted inline, a 5xx on one old href ended every pass before later events were written), only while the
+  record has a hash (its href is written), its calendar is the target and the event is relayed; 404/410
+  count as done, a refused DELETE fails that event and a connection error ends the pass, and both stay
+  pending. An event that is over is forgotten with its pending hrefs. A pending href must be one of the
+  event's own names (`relay-<hex>(-<token>)?.ics`) inside the record's calendar or the relay's target
+  calendar, or it is forgotten without a request; a record's own href is never pending (`with_pending`
+  drops it). If the fresh PUT is refused too, the record keeps its href with the hash cleared (an entry
+  deleted on a device also answers 412, so it may be missing, and a match moved back must still be written)
+  and the error maps like any PUT: a 412, 400 or refused event fails alone; a bare 403, 404/409, 429/5xx
+  end the pass. Unconfirmed writes (after review; deviates from "leave the record" for no-answer cases):
+  before the fresh PUT is sent, the record already points at the fresh href and token with an empty hash
+  and the old href pending (`_async_attempt`). A PUT without a usable answer (timeout, 429, 5xx) keeps that
+  record, and so does a pass cancelled mid-PUT (entry reload, unload and HA stop cancel background tasks;
+  the store is saved in `finally`). The next pass writes the same name again (create or update) instead of
+  drawing a new token: no untracked duplicate, and `pending` does not grow by one href per failing pass.
+  Moves and put-backs record every PUT the same way. When the new calendar gives no usable answer, the copy
+  is still put back (0.2.x behavior) with the possibly written new-calendar href pending; the next move
+  carries it into the new record and it is deleted once the event is written there. If the put-back is
+  refused, the record follows the new-calendar href. Withdrawn events delete pending hrefs, then the stored
+  href whatever its token. When that href is deleted but a pending DELETE fails, or its DELETE gets no
+  usable answer, the kept record's hash is cleared (review finding: with the hash kept, a call-up
+  reinstated unchanged was never written again and the calendar ended without it). `token` and `pending` are only stored when not empty, so 0.2.x stores load unchanged and no
+  migration is needed; a stored token must be letters and digits (1 to 32) or the record is ignored.
+  Devices show a re-identified event as new, and a duplicate shows until the old entry is deleted. An
+  event that is over before a pass succeeds stays missing: the source no longer returns it.
 - Error text (0.2.2): every error raised from an HTTP answer without a DAV:error condition (PUT, DELETE,
   discovery, 401, 429/5xx) carries `excerpt`, up to 160 characters of the body. HTML character references,
   JSON string escapes and percent-encoding are decoded first; then credentials (username, its
@@ -119,8 +160,9 @@ with a per-child prefix, plus the match's place and when to leave.
   and whitespace is collapsed; XML namespace URIs are kept.
   `str(err)` ends with `, response body: <excerpt>` and goes to warnings; `err.summary` leaves it out and
   is what `last_error`, the sensor attribute and diagnostics get, because a server may quote event text.
-  Tests for the retry run the real client against FakeDav serving HTTP over aioclient_mock (`dav_server`
-  fixture); the Radicale e2e test cannot produce iCloud's 412, so it is not faked there.
+  Tests for the 412 path run the real client against FakeDav serving HTTP over aioclient_mock (`dav_server`
+  fixture), which blocks the href and UID of opened and deleted entries like iCloud; the Radicale e2e test
+  cannot produce iCloud's 412, so it is not faked there.
 - Removed relays: a `calendar_relay.relays_<entry_id>` Store lists relay ids with state; setup and
   entry removal drop the state and repair issue of ids no longer present, also when the relay was removed
   while the entry was not loaded.

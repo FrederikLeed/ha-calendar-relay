@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import socket
 import threading
@@ -94,6 +95,13 @@ def _as_datetime(value: date | datetime) -> datetime:
     return dt_util.start_of_local_day(value)
 
 
+def uid_of(body: str) -> str:
+    """Return the UID of an event's iCalendar text."""
+    found = re.search(r"^UID:([^\r\n]+)", body, re.MULTILINE)
+    assert found is not None
+    return found.group(1)
+
+
 class FakeDav:
     """In-memory stand-in for CalDavClient. Calling the instance acts as the class.
 
@@ -115,32 +123,61 @@ class FakeDav:
         self.discover_error: Exception | None = None
         self.put_error: Exception | Callable[[str, str], Exception | None] | None = None
         self.delete_error: Exception | None = None
-        # Served over HTTP: hrefs opened on an Apple device, which answer a plain PUT with 412 until they are
-        # deleted, hrefs whose other PUTs answer with a status instead of writing, and the body of those answers.
-        self.opened: set[str] = set()
+        # Served over HTTP, the way iCloud behaves: resource hrefs and UIDs that answer a PUT with 412 for good (an
+        # entry opened on an Apple device, and every href and UID that was deleted), hrefs whose PUTs or DELETEs
+        # answer with a status instead of acting, the status of PUTs that would create a resource and whether such a
+        # PUT still writes (as when a timeout hides a write that went through), and the body of those answers.
+        self.blocked: set[str] = set()
         self.failing: dict[str, int] = {}
+        self.delete_failing: dict[str, int] = {}
+        self.create_failure: tuple[int, bool] | None = None
         self.refusal_body = ""
+        # How many more PUTs of a fresh name (one with a token) are carried out while the pass is cancelled before
+        # their answer arrives, as when Home Assistant stops or reloads the entry during a sync.
+        self.cancel_fresh_puts = 0
 
     def serve(self, aioclient_mock: AiohttpClientMocker, calendar_url: str = FAMILY_URL) -> None:
-        """Answer PUT and DELETE of the relay's event resources in calendar_url."""
-        resources = re.compile(f"^{re.escape(calendar_url)}relay-[0-9a-f]{{32}}\\.ics$")
+        """Answer PUT and DELETE of the relay's event resources in calendar_url, with or without a token."""
+        resources = re.compile(f"^{re.escape(calendar_url)}relay-[0-9a-f]{{32}}(?:-[0-9A-Za-z]+)?\\.ics$")
         for method in ("PUT", "DELETE"):
             aioclient_mock.request(method, resources, side_effect=self._async_answer)
 
+    def open_on_device(self, href: str) -> None:
+        """Open an entry on an Apple device: its href and UID answer a PUT with 412 from now on."""
+        self.blocked.update({href, uid_of(self.resources[href])})
+
+    def delete_on_device(self, href: str) -> None:
+        """Delete an entry on an Apple device: it is gone, and its href and UID answer a PUT with 412."""
+        self.blocked.update({href, uid_of(self.resources.pop(href))})
+
     async def _async_answer(self, method: str, url: URL, data: bytes | None) -> AiohttpClientMockResponse:
-        """Answer one request: 201 or 204 for a PUT, 412 while opened or the failing status, 204 or 404 for a DELETE."""
+        """Answer one request: 201 or 204 for a PUT, 412 while blocked, a failing status, 204 or 404 for a DELETE."""
         href = str(url)
         method = method.upper()
         self.calls.append((method, href))
         if method == "DELETE":
-            self.opened.discard(href)
-            status = 204 if self.resources.pop(href, None) is not None else 404
-            return AiohttpClientMockResponse(method, url, status=status)
-        if href in self.opened or href in self.failing:
-            status = 412 if href in self.opened else self.failing[href]
+            if href in self.delete_failing:
+                return AiohttpClientMockResponse(method, url, status=self.delete_failing[href], text=self.refusal_body)
+            body = self.resources.pop(href, None)
+            if body is None:
+                return AiohttpClientMockResponse(method, url, status=404)
+            self.blocked.update({href, uid_of(body)})
+            return AiohttpClientMockResponse(method, url, status=204)
+        body = (data or b"").decode()
+        if href in self.blocked or uid_of(body) in self.blocked:
+            return AiohttpClientMockResponse(method, url, status=412, text=self.refusal_body)
+        if href in self.failing:
+            return AiohttpClientMockResponse(method, url, status=self.failing[href], text=self.refusal_body)
+        if href not in self.resources and self.create_failure is not None:
+            status, written = self.create_failure
+            if written:
+                self.resources[href] = body
             return AiohttpClientMockResponse(method, url, status=status, text=self.refusal_body)
         status = 204 if href in self.resources else 201
-        self.resources[href] = (data or b"").decode()
+        self.resources[href] = body
+        if self.cancel_fresh_puts and re.search(r"relay-[0-9a-f]{32}-[0-9A-Za-z]+\.ics$", href):
+            self.cancel_fresh_puts -= 1
+            raise asyncio.CancelledError
         return AiohttpClientMockResponse(method, url, status=status)
 
     def __call__(self, session: Any, url: str, username: str, password: str) -> FakeDav:

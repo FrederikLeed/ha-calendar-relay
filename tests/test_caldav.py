@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import base64
 import logging
-from collections.abc import Awaitable, Callable
 
 import aiohttp
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker, AiohttpClientMockResponse
-from yarl import URL
+from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMocker
 
 from custom_components.calendar_relay.caldav import (
     EXCERPT_WITHHELD,
@@ -89,17 +87,6 @@ def client(hass: HomeAssistant, url: str = ICLOUD) -> CalDavClient:
 def calls(aioclient_mock: AiohttpClientMocker) -> list[tuple[str, str]]:
     """Return (method, url) of every request."""
     return [(method.upper(), str(url)) for method, url, _data, _headers in aioclient_mock.mock_calls]
-
-
-def answers(*replies: tuple[int, str]) -> Callable[[str, URL, bytes | None], Awaitable[AiohttpClientMockResponse]]:
-    """Return a side effect that answers successive requests with the given status and body, in turn."""
-    queue = list(replies)
-
-    async def answer(method: str, url: URL, data: bytes | None) -> AiohttpClientMockResponse:
-        status, body = queue.pop(0)
-        return AiohttpClientMockResponse(method, url, status=status, text=body)
-
-    return answer
 
 
 def mock_icloud(aioclient_mock: AiohttpClientMocker) -> None:
@@ -454,7 +441,7 @@ async def test_put_errors(
 ) -> None:
     """A 403 or 409 with a DAV:error reason refuses this event only (CalendarServer answers a UID that exists
     in another calendar with 403, Radicale a UID conflict with 409). A bare 403 is an auth error; 404 and a
-    bare 409 mean the calendar is missing. Without a reason the message quotes the answer. Only 412 deletes."""
+    bare 409 mean the calendar is missing. Without a reason the message quotes the answer."""
     aioclient_mock.put(f"{ICLOUD_HOME}family/relay-1.ics", status=status, text=body)
     with pytest.raises(error) as err:
         await client(hass).async_put_event(f"{ICLOUD_HOME}family/", "relay-1.ics", "X")
@@ -463,96 +450,30 @@ async def test_put_errors(
     assert err.value.condition == condition
     assert str(err.value) == message
     assert err.value.summary == message.split(",", 1)[0]
-    assert err.value.resource_deleted is False
     assert len(aioclient_mock.mock_calls) == 1
 
 
-@pytest.mark.parametrize("delete_status", [204, 200, 404, 410])
-async def test_put_refused_with_412_deletes_the_resource_and_writes_it_again(
-    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, delete_status: int
-) -> None:
-    """iCloud answers a plain PUT to an entry opened on an Apple device with 412 and no DAV:error condition.
-
-    The resource is deleted, also when it is already gone (404 or 410), and written once more.
-    """
-    href = f"{ICLOUD_HOME}family/relay-1.ics"
-    aioclient_mock.put(href, side_effect=answers((412, ""), (201, "")))
-    aioclient_mock.delete(href, status=delete_status)
-    ics = "BEGIN:VCALENDAR\r\nSUMMARY:⚽ Emma: Home - Away\r\nEND:VCALENDAR\r\n"
-
-    assert await client(hass).async_put_event(f"{ICLOUD_HOME}family/", "relay-1.ics", ics) == href
-    assert calls(aioclient_mock) == [("PUT", href), ("DELETE", href), ("PUT", href)]
-    assert [data for _method, _url, data, _headers in aioclient_mock.mock_calls] == [ics.encode(), None, ics.encode()]
-    assert aioclient_mock.mock_calls[1][3] == {"Authorization": EXPECTED_AUTH}
-
-
 @pytest.mark.parametrize(
-    ("status", "body", "error", "message"),
-    [
-        (412, "Precondition Failed", CalDavStatusError, "HTTP 412, response body: Precondition Failed"),
-        (403, "", CalDavAuthError, "HTTP 403"),
-        (404, "", CalDavNotFoundError, "HTTP 404"),
-        (409, NO_UID_CONFLICT, CalDavRefusedError, "HTTP 409 (no-uid-conflict)"),
-        (503, "", CalDavConnectionError, "PUT returned HTTP 503"),
-    ],
+    ("body", "message"),
+    [("", "HTTP 412"), ("Precondition Failed", "HTTP 412, response body: Precondition Failed")],
 )
-async def test_put_after_412_is_sent_once(
-    hass: HomeAssistant,
-    aioclient_mock: AiohttpClientMocker,
-    status: int,
-    body: str,
-    error: type[CalDavStatusError],
-    message: str,
+async def test_put_refused_with_412_is_raised_after_one_put(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker, body: str, message: str
 ) -> None:
-    """A write that fails again after the delete is not retried; its answer raises the way a first answer does, and
-    the error says the resource was deleted."""
-    href = f"{ICLOUD_HOME}family/relay-1.ics"
-    aioclient_mock.put(href, side_effect=answers((412, ""), (status, body)))
-    aioclient_mock.delete(href, status=204)
-    with pytest.raises(error) as err:
-        await client(hass).async_put_event(f"{ICLOUD_HOME}family/", "relay-1.ics", "X")
-    assert type(err.value) is error
-    assert str(err.value) == message
-    assert err.value.resource_deleted is True
-    assert calls(aioclient_mock) == [("PUT", href), ("DELETE", href), ("PUT", href)]
-
-
-@pytest.mark.parametrize(
-    ("delete", "error", "message", "deleted"),
-    [
-        ({"status": 403}, CalDavAuthError, "HTTP 403", False),
-        ({"status": 400, "text": "Bad Request"}, CalDavStatusError, "HTTP 400, response body: Bad Request", False),
-        (
-            {"status": 301, "headers": {"Location": f"{ICLOUD_HOME}family/"}},
-            CalDavError,
-            "Refusing to follow a redirect away from the event resource",
-            False,
-        ),
-        ({"status": 503}, CalDavConnectionError, "DELETE returned HTTP 503", True),
-        ({"exc": TimeoutError()}, CalDavConnectionError, "DELETE failed: TimeoutError", True),
-    ],
-)
-async def test_put_after_412_is_not_sent_when_the_delete_fails(
-    hass: HomeAssistant,
-    aioclient_mock: AiohttpClientMocker,
-    delete: dict,
-    error: type[CalDavError],
-    message: str,
-    deleted: bool,
-) -> None:
-    """The DELETE keeps its error mapping and its redirect guard, and nothing is written after it fails. A DELETE
-    without a usable answer may have been carried out, so its error says the resource may be deleted."""
+    """iCloud answers a plain PUT to an entry opened on an Apple device, or to a deleted name or UID, with 412 and no
+    DAV:error condition, and writing the same name again does not help. So the client sends one PUT, never a DELETE,
+    and raises the status for the relay, which writes the event under another name."""
     calendar = f"{ICLOUD_HOME}family/"
     href = f"{calendar}relay-1.ics"
-    aioclient_mock.put(href, status=412)
-    aioclient_mock.delete(href, **delete)
-    aioclient_mock.delete(calendar, status=204)
-    with pytest.raises(error) as err:
+    aioclient_mock.put(href, status=412, text=body)
+    aioclient_mock.delete(href, status=204)
+    with pytest.raises(CalDavStatusError) as err:
         await client(hass).async_put_event(calendar, "relay-1.ics", "X")
-    assert type(err.value) is error
+    assert type(err.value) is CalDavStatusError
+    assert (err.value.status, err.value.condition) == (412, None)
     assert str(err.value) == message
-    assert err.value.resource_deleted is deleted
-    assert calls(aioclient_mock) == [("PUT", href), ("DELETE", href)]
+    assert err.value.summary == "HTTP 412"
+    assert calls(aioclient_mock) == [("PUT", href)]
 
 
 async def test_error_quotes_a_safe_excerpt_of_the_answer(

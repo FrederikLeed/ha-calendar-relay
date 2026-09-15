@@ -7,10 +7,12 @@ import hashlib
 import json
 import math
 import re
+import secrets
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import voluptuous as vol
 from homeassistant.components.calendar import DATA_COMPONENT, CalendarEvent
@@ -32,6 +34,7 @@ from .caldav import (
     CalDavConnectionError,
     CalDavError,
     CalDavNotFoundError,
+    CalDavStatusError,
     DavCalendar,
     collection_url,
     is_event_href,
@@ -85,6 +88,10 @@ from .location import Coordinates, find_coordinates
 
 UID_DOMAIN = "calendar-relay"
 RECORD_FIELDS = ("href", "hash", "start", "end", "target")
+# Random bytes of a generation token, which is written as twice as many hex digits.
+TOKEN_BYTES = 4
+# A stored generation token: letters and digits only, so the resource name still reads relay-<id>-<token>.ics.
+_TOKEN = re.compile(r"[A-Za-z0-9]{1,32}")
 
 _LEADING_SEPARATORS = re.compile(r"^[\s:;,|-]+")
 # Errors that end a pass: nothing else will work either until they are fixed.
@@ -150,6 +157,62 @@ def event_key(event: CalendarEvent) -> str:
 def resource_id(subentry_id: str, key: str) -> str:
     """Return the hex id used for the resource name and UID of a relayed event."""
     return hashlib.sha256(f"{subentry_id}{key}".encode()).hexdigest()[:32]
+
+
+def resource_name(rid: str, token: str = "") -> str:
+    """Return the resource name of a relayed event: relay-<rid>.ics, or relay-<rid>-<token>.ics with a token."""
+    return f"relay-{rid}-{token}.ics" if token else f"relay-{rid}.ics"
+
+
+def event_uid(rid: str, token: str = "") -> str:
+    """Return the UID of a relayed event: <rid>@calendar-relay, or <rid>-<token>@calendar-relay with a token."""
+    return f"{rid}-{token}@{UID_DOMAIN}" if token else f"{rid}@{UID_DOMAIN}"
+
+
+def new_token(current: str = "") -> str:
+    """Return a random generation token for a fresh resource name and UID, never the current one."""
+    token = secrets.token_hex(TOKEN_BYTES)
+    while token == current:
+        token = secrets.token_hex(TOKEN_BYTES)
+    return token
+
+
+def is_own_resource(rid: str, href: str) -> bool:
+    """Return True if href ends with a resource name of the relayed event rid, with or without a token."""
+    name = unquote(urlsplit(href).path).rsplit("/", 1)[-1]
+    return re.fullmatch(rf"relay-{re.escape(rid)}(?:-[A-Za-z0-9]{{1,32}})?\.ics", name) is not None
+
+
+def stored_record(value: Any) -> dict[str, Any] | None:
+    """Return a stored event record, or None if it is not valid.
+
+    href, hash, start, end and target are strings. token, the generation token of the resource name
+    and UID, and pending, the hrefs of earlier entries of the event still to be deleted, are only
+    stored when they are not empty, so records written before they existed load as they are.
+    """
+    if not isinstance(value, dict) or not all(isinstance(value.get(name), str) for name in RECORD_FIELDS):
+        return None
+    token = value.get("token", "")
+    pending = value.get("pending", [])
+    if not isinstance(token, str) or (token and _TOKEN.fullmatch(token) is None):
+        return None
+    if not isinstance(pending, list) or not all(isinstance(href, str) for href in pending):
+        return None
+    record: dict[str, Any] = {name: value[name] for name in RECORD_FIELDS}
+    if token:
+        record["token"] = token
+    return with_pending(record, pending)
+
+
+def with_pending(record: Mapping[str, Any], pending: Iterable[str]) -> dict[str, Any]:
+    """Return a copy of an event record whose earlier entries still to be deleted are pending, without repeats.
+
+    The record's own href is never pending, so the entry the record points at is never deleted as an earlier one.
+    """
+    updated = {name: value for name, value in record.items() if name != "pending"}
+    if hrefs := [href for href in dict.fromkeys(pending) if href != record.get("href")]:
+        updated["pending"] = hrefs
+    return updated
 
 
 def has_started(start: date | datetime, now: datetime) -> bool:
@@ -394,10 +457,13 @@ WAZE_QUEUE: HassKey[WazeQueue] = HassKey(f"{DOMAIN}_waze_queue")
 
 @dataclass(slots=True)
 class PlannedEvent:
-    """An event as it should exist in the target calendar."""
+    """An event as it should exist in the target calendar.
 
-    name: str
-    uid: str
+    rid is the id in its resource name and UID; the generation token that completes them is kept
+    in the event's record and passed to render.
+    """
+
+    rid: str
     summary: str
     start: date | datetime
     end: date | datetime
@@ -414,8 +480,11 @@ class PlannedEvent:
     time_zone: str | None = None
     content_hash: str = ""
 
-    def render(self, dtstamp: datetime | None = None) -> str:
-        """Render the event. Without dtstamp the text is stable and used for change detection.
+    def render(self, dtstamp: datetime | None = None, token: str = "") -> str:
+        """Render the event with the UID for token. Without dtstamp and token the text is used for change detection.
+
+        So the content hash does not depend on the token: an event keeps its hash when it moves to a
+        fresh identity, and records written before tokens existed keep theirs.
 
         With a travel time, a timed event gets a leave line at the top of its description,
         Apple's travel duration covering travel time plus arrive early (buffer_minutes), and
@@ -431,7 +500,7 @@ class PlannedEvent:
             line = leave_text(self.language, leave_at, self.travel_minutes, days_before, self.buffer_minutes)
             description = f"{line}\n{description}" if description else line
         return render_event(
-            uid=self.uid,
+            uid=event_uid(self.rid, token),
             summary=self.summary,
             start=self.start,
             end=self.end,
@@ -475,7 +544,8 @@ class Relay:
         self._client = client
         self._account_calendars = account_calendars
         self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, storage_key(self.subentry_id), private=True)
-        self._events: dict[str, dict[str, str]] = {}
+        # key -> record: href, hash, start, end and target, plus token and pending when they are not empty.
+        self._events: dict[str, dict[str, Any]] = {}
         # key -> Waze travel time. Kept apart from _events, so a write that fails does not lose a paid-for answer.
         self._travel: dict[str, TravelRecord] = {}
         # key -> retry of events whose travel time failed. Stored, so a restart does not ask for all of them at once.
@@ -516,9 +586,7 @@ class Relay:
         events = data.get("events")
         if isinstance(events, dict):
             self._events = {
-                key: {name: record[name] for name in RECORD_FIELDS}
-                for key, record in events.items()
-                if isinstance(record, dict) and all(isinstance(record.get(name), str) for name in RECORD_FIELDS)
+                key: record for key, value in events.items() if (record := stored_record(value)) is not None
             }
         # Travel times are checked on their own, so a bad one never discards the event records.
         travel = data.get("travel")
@@ -619,6 +687,8 @@ class Relay:
             if complete and self._removals_confirmed(events, now):
                 await self._async_remove_unwanted(planned, now, failures)
             self._forget_travel(planned)
+            # Earlier entries of relayed events come last, so one that cannot be deleted holds nothing else back.
+            await self._async_finish_pending(planned, failures)
         # Warnings show the whole error; last_error only its summary, since an excerpt of the answer can quote events.
         except CalDavAuthError as err:
             LOGGER.warning("Relay %s: the server refused the request (%s), starting reauthentication", self.title, err)
@@ -707,8 +777,7 @@ class Relay:
         coordinates = find_coordinates(event.description, event.location)
         place = structured_location(event.location, coordinates) if config.structured_location else None
         item = PlannedEvent(
-            name=f"relay-{rid}.ics",
-            uid=f"{rid}@{UID_DOMAIN}",
+            rid=rid,
             summary=transform_title(
                 event.summary,
                 title_filter=config.title_filter,
@@ -963,96 +1032,284 @@ class Relay:
         start reauthentication.
         """
         if isinstance(err, CalDavAuthError) and err.status == 403 and not self._on_account(calendar_url):
-            converted = CalDavNotFoundError(err.status, err.condition, err.excerpt)
-            converted.resource_deleted = err.resource_deleted
-            return converted
+            return CalDavNotFoundError(err.status, err.condition, err.excerpt)
         return err
 
-    async def _async_put(self, calendar_url: str, item: PlannedEvent, now: datetime) -> str:
-        """PUT an event into a calendar and return its href."""
+    async def _async_put(self, calendar_url: str, item: PlannedEvent, token: str, now: datetime) -> str:
+        """PUT an event into a calendar under the resource name and UID of token, and return its href."""
         try:
-            return await self._client.async_put_event(calendar_url, item.name, item.render(dtstamp=now))
+            return await self._client.async_put_event(
+                calendar_url, resource_name(item.rid, token), item.render(dtstamp=now, token=token)
+            )
         except CalDavError as err:
             converted = self._foreign_refusal(err, calendar_url)
             if converted is err:
                 raise
             raise converted from err
 
-    async def _async_delete(self, record: Mapping[str, str]) -> bool:
-        """Delete a relayed event from the calendar it was written to.
+    async def _async_write(
+        self,
+        key: str,
+        calendar_url: str,
+        item: PlannedEvent,
+        token: str,
+        now: datetime,
+        *,
+        pending: Iterable[str] = (),
+        replaced: Iterable[str] = (),
+        fallback: Mapping[str, Any] | None = None,
+        track: bool = False,
+    ) -> None:
+        """Write and record an event under token, or once under a fresh identity when that answers 412.
 
-        Return True if a copy was deleted now, False if it was already gone (404 or
-        410) or its stored href is not inside its calendar (then nothing is sent).
+        iCloud answers a PUT with 412 for an entry someone opened on an Apple device, and for a
+        resource name or UID that was deleted, and keeps doing so. So a 412 is answered by one PUT
+        under a new generation token, which gives a new resource name and UID, and never more.
+        The record of the written event holds pending as its earlier entries still to be deleted,
+        and after a fresh identity replaced as well.
+
+        The fresh PUT, and with track the first one too, is recorded before it is sent (see
+        _async_attempt), with fallback as the record if it is refused. A first PUT without track
+        that fails leaves the record as it was. Errors are raised.
         """
-        calendar_url = record["target"]
-        if not is_event_href(calendar_url, record["href"]):
+        pending = list(pending)
+        try:
+            if track:
+                await self._async_attempt(key, calendar_url, item, token, now, pending, fallback)
+            else:
+                href = await self._async_put(calendar_url, item, token, now)
+                self._remember(key, item, href, calendar_url, token, pending)
+        except CalDavStatusError as err:
+            if err.status != 412:
+                raise
+            LOGGER.debug("Relay %s: an entry cannot be written under its name (%s), trying a new name", self.title, err)
+        else:
+            return
+        await self._async_attempt(key, calendar_url, item, new_token(token), now, [*pending, *replaced], fallback)
+
+    async def _async_attempt(
+        self,
+        key: str,
+        calendar_url: str,
+        item: PlannedEvent,
+        token: str,
+        now: datetime,
+        pending: list[str],
+        fallback: Mapping[str, Any] | None,
+    ) -> None:
+        """PUT an event under token with its record set before the request is sent, and record it once written.
+
+        Until the PUT is answered, the record points at the resource it writes, with the hash cleared.
+        When no usable answer arrives (a timeout, 429 or 5xx) the PUT may have been carried out, and so
+        may one whose pass is cancelled meanwhile (Home Assistant stopping, the entry reloading): that
+        record stays and is saved, so the next pass writes the same name again, which creates or updates
+        it, and no entry is left under a name nothing remembers. A refused PUT wrote nothing, so the
+        record becomes fallback, or is removed without one.
+        """
+        href = collection_url(calendar_url) + resource_name(item.rid, token)
+        self._events[key] = self._record(item, href, calendar_url, token, pending, written=False)
+        self._dirty = True
+        try:
+            href = await self._async_put(calendar_url, item, token, now)
+        except CalDavConnectionError:
+            raise
+        except CalDavError:
+            if fallback is None:
+                del self._events[key]
+            else:
+                self._events[key] = dict(fallback)
+            raise
+        self._remember(key, item, href, calendar_url, token, pending)
+
+    async def _async_delete(self, calendar_url: str, href: str) -> bool:
+        """Delete a relayed entry from the calendar it was written to.
+
+        Return True if it was deleted now, False if it was already gone (404 or 410)
+        or href is not inside the calendar (then nothing is sent).
+        """
+        if not is_event_href(calendar_url, href):
             LOGGER.warning("Relay %s: a stored event is not inside its calendar, forgetting it", self.title)
             return False
         try:
-            return await self._client.async_delete_event(calendar_url, record["href"])
+            return await self._client.async_delete_event(calendar_url, href)
         except CalDavError as err:
             converted = self._foreign_refusal(err, calendar_url)
             if converted is err:
                 raise
             raise converted from err
 
-    def _remember(self, key: str, item: PlannedEvent, href: str, target: str) -> None:
-        """Record where an event was written and what it looked like."""
-        self._events[key] = {
+    def _pending_calendar(self, key: str, record: Mapping[str, Any], href: str) -> str | None:
+        """Return the calendar to delete an earlier entry of an event from, or None if it is not the event's.
+
+        It must be a resource name of this event (relay-<id>.ics or relay-<id>-<token>.ics) directly
+        inside the record's calendar or the relay's target calendar: a move whose PUT got no usable
+        answer leaves one in the new calendar while the event is put back into the old one.
+        """
+        if not is_own_resource(resource_id(self.subentry_id, key), href):
+            return None
+        for calendar_url in (record["target"], self.config.target):
+            if is_event_href(calendar_url, href):
+                return calendar_url
+        return None
+
+    async def _async_delete_pending(self, key: str, calendar_url: str | None = None) -> None:
+        """Delete an event's earlier entries still to be deleted; with calendar_url, only the ones inside it.
+
+        Only resources of this event are deleted (see _pending_calendar); any other href is forgotten
+        without a request. An entry that is deleted, or already gone, leaves the record. An account
+        error is raised at once; after any other error the rest are still tried, and the first error
+        is raised.
+        """
+        record = self._events[key]
+        error: CalDavError | None = None
+        for href in record.get("pending", []):
+            calendar = self._pending_calendar(key, record, href)
+            if calendar is None:
+                LOGGER.warning("Relay %s: a stored earlier entry is not one of its event's, forgetting it", self.title)
+            elif calendar_url is not None and calendar != calendar_url:
+                continue
+            else:
+                try:
+                    await self._async_delete(calendar, href)
+                except _ACCOUNT_ERRORS:
+                    raise
+                except CalDavError as err:
+                    error = error or err
+                    continue
+            current = self._events[key]
+            self._events[key] = with_pending(current, [other for other in current.get("pending", []) if other != href])
+            self._dirty = True
+        if error is not None:
+            raise error
+
+    @staticmethod
+    def _record(
+        item: PlannedEvent, href: str, target: str, token: str, pending: Iterable[str], *, written: bool
+    ) -> dict[str, Any]:
+        """Return the record of an event at href in target under token, with its hash once written, else cleared."""
+        record: dict[str, Any] = {
             "href": href,
-            "hash": item.content_hash,
+            "hash": item.content_hash if written else "",
             "start": _iso(item.start),
             "end": _iso(item.end),
             "target": target,
         }
+        if token:
+            record["token"] = token
+        return with_pending(record, pending)
+
+    def _remember(
+        self, key: str, item: PlannedEvent, href: str, target: str, token: str, pending: Iterable[str]
+    ) -> None:
+        """Record where an event was written, under which token, what it looked like, and what is left to delete."""
+        self._events[key] = self._record(item, href, target, token, pending, written=True)
         self._dirty = True
 
     async def _async_write_planned(self, planned: dict[str, PlannedEvent], now: datetime, failures: list[str]) -> None:
-        """PUT new events and events whose content changed; move events whose target calendar changed.
-
-        When a write fails after the client deleted the event to write it again (iCloud's 412), the
-        stored hash is cleared, so the next pass writes the event whatever it holds by then.
-        """
+        """PUT new events and events whose content changed; move events whose target calendar changed."""
         target = self.config.target
         for key, item in planned.items():
             record = self._events.get(key)
             if record is not None and record["target"] != target:
                 await self._async_move(key, record, item, now, failures)
-                continue
-            if record is not None and record["hash"] == item.content_hash:
+            elif record is None or record["hash"] != item.content_hash:
+                await self._async_write_event(key, record, item, now, failures)
+
+    async def _async_write_event(
+        self, key: str, record: dict[str, Any] | None, item: PlannedEvent, now: datetime, failures: list[str]
+    ) -> None:
+        """Write a new or changed event into the target calendar.
+
+        A tracked event is written under its stored token, a new one under no token. After a 412 the
+        event moves to one fresh identity, and its entry until then is to be deleted once it is written.
+        When the fresh identity is refused too, the record stays where it was with its hash cleared, so
+        the next pass writes the event whatever it holds by then: iCloud also answers 412 for an entry
+        deleted on a device, so the entry may be missing. When the fresh PUT gets no usable answer, the
+        record stays on the fresh identity (see _async_attempt), also for a new event.
+        """
+        target = self.config.target
+        try:
+            if record is None:
+                await self._async_write(key, target, item, "", now)
+            else:
+                await self._async_write(
+                    key,
+                    target,
+                    item,
+                    record.get("token", ""),
+                    now,
+                    pending=record.get("pending", []),
+                    replaced=[record["href"]],
+                    fallback={**record, "hash": ""},
+                )
+        except CalDavError as err:
+            if isinstance(err, _PASS_ENDING_ERRORS):
+                raise
+            LOGGER.warning("Relay %s: writing an event failed, retrying on the next pass: %s", self.title, err)
+            failures.append(err.summary)
+
+    async def _async_finish_pending(self, planned: Mapping[str, PlannedEvent], failures: list[str]) -> None:
+        """Delete the earlier entries still to be deleted of relayed events that are written; retry failures later.
+
+        This runs after every write and removal of the pass, so an entry that cannot be deleted, or a
+        server error while deleting it, holds back no other event. An event that is not written yet
+        (its record has no hash) keeps them, so nothing that was there goes missing before its new
+        entry is written. Events still in a previous target calendar are left to _async_move.
+        """
+        target = self.config.target
+        for key in planned:
+            record = self._events.get(key)
+            if record is None or record["target"] != target or not record["hash"] or not record.get("pending"):
                 continue
             try:
-                href = await self._async_put(target, item, now)
+                await self._async_delete_pending(key)
+            except _PASS_ENDING_ERRORS:
+                raise
             except CalDavError as err:
-                if record is not None and err.resource_deleted:
-                    self._events[key] = {**record, "hash": ""}
-                    self._dirty = True
-                if isinstance(err, _PASS_ENDING_ERRORS):
-                    raise
-                LOGGER.warning("Relay %s: writing an event failed, retrying on the next pass: %s", self.title, err)
+                LOGGER.warning(
+                    "Relay %s: deleting an earlier entry of an event failed, retrying on the next pass: %s",
+                    self.title,
+                    err,
+                )
                 failures.append(err.summary)
-                continue
-            self._remember(key, item, href, target)
 
     async def _async_move(
-        self, key: str, record: dict[str, str], item: PlannedEvent, now: datetime, failures: list[str]
+        self, key: str, record: dict[str, Any], item: PlannedEvent, now: datetime, failures: list[str]
     ) -> None:
         """Move an event into the new target calendar.
 
         Servers refuse one UID in two calendars of the same account, so the old copy
-        is deleted first. If it cannot be deleted for a reason that will not go away,
-        it is left behind and the event is still written. If the new calendar refuses
-        the event, the copy is put back into the old calendar and the move is not
-        tried again until the event or the target changes, so a refusing calendar
-        can never empty the old one.
+        is deleted first, after its earlier entries in the old calendar still to be
+        deleted. If they cannot be deleted for a reason that will not go away, they are
+        left behind and the event is still written. If the new calendar refuses the
+        event, the copy is put back into the old calendar and the move is not tried
+        again until the event or the target changes, so a refusing calendar can never
+        empty the old one. Both writes keep the event's token, get a fresh one after a
+        412, and are recorded before they are sent (see _async_attempt). A copy is also
+        put back when the new calendar gives no usable answer; the entry that may have
+        been written there then stays to be deleted, with the copy put back, or as the
+        event's record when the put-back fails. Earlier entries in the new calendar are
+        deleted once the event is written there.
         """
         target = self.config.target
         refused = self._failed_moves.get(key)
         if refused is not None and refused[:2] == (target, item.content_hash):
             failures.append(refused[2])
             return
+        token = record.get("token", "")
         try:
-            deleted = await self._async_delete(record)
+            await self._async_delete_pending(key, record["target"])
+        except _ACCOUNT_ERRORS:
+            raise
+        except CalDavError as err:
+            LOGGER.warning(
+                "Relay %s: an earlier entry of a moved event could not be deleted and stays in the old calendar: %s",
+                self.title,
+                err,
+            )
+        carried = [href for href in self._events[key].get("pending", []) if is_event_href(target, href)]
+        try:
+            deleted = await self._async_delete(record["target"], record["href"])
         except _ACCOUNT_ERRORS:
             raise
         except CalDavError as err:
@@ -1062,13 +1319,17 @@ class Relay:
                 err,
             )
             deleted = False
-        del self._events[key]
-        self._dirty = True
         try:
-            href = await self._async_put(target, item, now)
+            await self._async_write(key, target, item, token, now, pending=carried, track=True)
         except CalDavError as err:
+            # A record left in the new calendar holds an entry that a PUT without a usable answer may have written.
+            unconfirmed = self._events.pop(key, None)
+            self._dirty = True
             if deleted:
-                await self._async_restore(key, record, item, now)
+                maybe_written = [unconfirmed["href"]] if unconfirmed is not None else []
+                await self._async_restore(key, record, item, token, now, [*carried, *maybe_written])
+            if unconfirmed is not None and key not in self._events:
+                self._events[key] = unconfirmed
             if isinstance(err, _ACCOUNT_ERRORS):
                 raise
             message = f"Moving an event to the new calendar failed: {err.summary}"
@@ -1079,29 +1340,71 @@ class Relay:
             failures.append(message)
             return
         self._failed_moves.pop(key, None)
-        self._remember(key, item, href, target)
 
-    async def _async_restore(self, key: str, record: Mapping[str, str], item: PlannedEvent, now: datetime) -> None:
-        """Put an event back into the calendar it was just deleted from."""
+    async def _async_restore(
+        self, key: str, record: Mapping[str, Any], item: PlannedEvent, token: str, now: datetime, pending: list[str]
+    ) -> None:
+        """Put an event back into the calendar it was just deleted from, under a fresh identity after a 412.
+
+        pending holds its entries still to be deleted. The put-back is recorded before it is sent (see
+        _async_attempt); when it is refused, the event is left without a record.
+        """
         try:
-            href = await self._client.async_put_event(record["target"], item.name, item.render(dtstamp=now))
+            await self._async_write(key, record["target"], item, token, now, pending=pending, track=True)
         except CalDavError as err:
             LOGGER.warning(
                 "Relay %s: putting a moved event back into the previous calendar failed: %s", self.title, err
             )
-            return
-        self._remember(key, item, href, record["target"])
+
+    async def _async_delete_withdrawn(self, key: str) -> None:
+        """Delete a withdrawn event's earlier entries still to be deleted, then its entry; raise the first error.
+
+        When the record is kept for a retry although its entry is deleted (an earlier entry could not be
+        deleted), or may have been (its DELETE got no usable answer), its hash is cleared: if the event
+        comes back unchanged it is written again, instead of counting as written while nothing is there.
+        """
+        record = self._events[key]
+        error: CalDavError | None = None
+        try:
+            await self._async_delete_pending(key)
+        except _ACCOUNT_ERRORS:
+            raise
+        except CalDavError as err:
+            error = err
+        try:
+            await self._async_delete(record["target"], record["href"])
+        except CalDavConnectionError:
+            self._clear_hash(key)
+            raise
+        except CalDavAuthError:
+            raise
+        except CalDavError as err:
+            error = error or err
+        else:
+            if error is not None:
+                self._clear_hash(key)
+        if error is not None:
+            raise error
+
+    def _clear_hash(self, key: str) -> None:
+        """Clear the hash of an event's record, so the next pass writes the event whatever it holds by then."""
+        self._events[key] = {**self._events[key], "hash": ""}
+        self._dirty = True
 
     async def _async_remove_unwanted(
         self, planned: dict[str, PlannedEvent], now: datetime, failures: list[str]
     ) -> None:
-        """DELETE withdrawn events that have not started; forget the ones that already started."""
+        """DELETE withdrawn events that have not started; forget the ones that already started.
+
+        A withdrawn event's entry is deleted by its stored href, whatever its token, together with
+        its earlier entries still to be deleted.
+        """
         target = self.config.target
         for key in [key for key in self._events if key not in planned]:
             record = self._events[key]
             if not has_started(parse_iso(record["start"]), now):
                 try:
-                    await self._async_delete(record)
+                    await self._async_delete_withdrawn(key)
                 except _ACCOUNT_ERRORS:
                     raise
                 except CalDavError as err:

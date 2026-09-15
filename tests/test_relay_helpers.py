@@ -5,11 +5,13 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.calendar import CalendarEvent
 
+from custom_components.calendar_relay.caldav import RESOURCE_NAME, is_event_href
 from custom_components.calendar_relay.ics import StructuredLocation
 from custom_components.calendar_relay.location import Coordinates
 from custom_components.calendar_relay.relay import (
@@ -17,15 +19,20 @@ from custom_components.calendar_relay.relay import (
     TravelRecord,
     TravelRetry,
     event_key,
+    event_uid,
     has_ended,
     has_started,
     is_danish,
+    is_own_resource,
     leave_text,
+    new_token,
     parse_iso,
     place_fingerprint,
     resource_id,
+    resource_name,
     retry_delay,
     round_travel_minutes,
+    stored_record,
     structured_location,
     title_matches,
     transform_title,
@@ -338,3 +345,84 @@ def test_invalid_travel_retries(value: Any) -> None:
 def test_retry_delay_doubles_up_to_a_day(failures: int, hours: int) -> None:
     """The wait doubles with every failure in a row and never exceeds 24 hours, however many failures are stored."""
     assert retry_delay(failures) == timedelta(hours=hours)
+
+
+RID = "0123456789abcdef" * 2
+CALENDAR = "https://dav.example.com/calendars/family/"
+
+
+def test_resource_names_and_uids_with_and_without_a_generation_token() -> None:
+    """Without a token the names are those of 0.2.2; a fresh token gives a new name and UID that are still valid."""
+    assert resource_name(RID) == f"relay-{RID}.ics"
+    assert event_uid(RID) == f"{RID}@calendar-relay"
+    token = new_token()
+    assert re.fullmatch(r"[0-9a-f]{8}", token)
+    assert resource_name(RID, token) == f"relay-{RID}-{token}.ics"
+    assert event_uid(RID, token) == f"{RID}-{token}@calendar-relay"
+    assert RESOURCE_NAME.fullmatch(resource_name(RID, token))
+    assert is_event_href(CALENDAR, CALENDAR + resource_name(RID, token))
+    assert new_token(token) != token
+
+
+def test_new_token_is_never_the_current_one() -> None:
+    """A random token that happens to be the current one is drawn again."""
+    with patch(
+        "custom_components.calendar_relay.relay.secrets.token_hex", side_effect=["0a1b2c3d", "0a1b2c3d", "4e5f"]
+    ):
+        assert new_token("0a1b2c3d") == "4e5f"
+
+
+@pytest.mark.parametrize(
+    ("href", "expected"),
+    [
+        (f"{CALENDAR}relay-{RID}.ics", True),
+        (f"{CALENDAR}relay-{RID}-0a1b2c3d.ics", True),
+        (f"https://other.example.com/x/relay-{RID}-0a1b2c3d.ics", True),
+        (f"{CALENDAR}relay-{'f' * 32}.ics", False),
+        (f"{CALENDAR}relay-{RID}-.ics", False),
+        (f"{CALENDAR}relay-{RID}-0a1b-2c3d.ics", False),
+        (f"{CALENDAR}relay-{RID}-{'a' * 33}.ics", False),
+        (f"{CALENDAR}ABCD-1234.ics", False),
+        (CALENDAR, False),
+    ],
+)
+def test_is_own_resource(href: str, expected: bool) -> None:
+    """Only the event's own names count; whether the href is inside the calendar is checked apart (is_event_href)."""
+    assert is_own_resource(RID, href) is expected
+
+
+EVENT_RECORD = {
+    "href": f"{CALENDAR}relay-{RID}.ics",
+    "hash": "0" * 64,
+    "start": "2026-09-20T10:00:00+00:00",
+    "end": "2026-09-20T12:00:00+00:00",
+    "target": CALENDAR,
+}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (EVENT_RECORD, EVENT_RECORD),
+        ({**EVENT_RECORD, "hash": ""}, {**EVENT_RECORD, "hash": ""}),
+        ({**EVENT_RECORD, "token": "", "pending": []}, EVENT_RECORD),
+        (
+            {**EVENT_RECORD, "token": "0a1b2c3d", "pending": ["a", "b", "a"], "other": 1},
+            {**EVENT_RECORD, "token": "0a1b2c3d", "pending": ["a", "b"]},
+        ),
+        ({**EVENT_RECORD, "pending": [EVENT_RECORD["href"], "a"]}, {**EVENT_RECORD, "pending": ["a"]}),
+        ({**EVENT_RECORD, "pending": [EVENT_RECORD["href"]]}, EVENT_RECORD),
+        ({**EVENT_RECORD, "token": "0a1b-2c3d"}, None),
+        ({**EVENT_RECORD, "token": "a" * 33}, None),
+        ({**EVENT_RECORD, "token": 5}, None),
+        ({**EVENT_RECORD, "pending": "a"}, None),
+        ({**EVENT_RECORD, "pending": [1]}, None),
+        ({key: value for key, value in EVENT_RECORD.items() if key != "target"}, None),
+        ({**EVENT_RECORD, "hash": None}, None),
+        ("not a record", None),
+    ],
+)
+def test_stored_record(value: Any, expected: dict[str, Any] | None) -> None:
+    """Records of 0.2.x load as they are; a token and pending removals are only kept when set and valid, and the
+    record's own href is never pending, so the entry it points at is never deleted as an earlier one."""
+    assert stored_record(value) == expected
