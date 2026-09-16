@@ -24,12 +24,15 @@ child:
 | Remove filter text from title | On |
 | Title prefix | `⚽ Emma: ` |
 
+**A complete worked example, with the source event, every setting, the entry the relay writes and what
+changes when a match moves: [docs/example-football-call-ups.md](docs/example-football-call-ups.md).**
+
 The call-up `⭐ Udtaget: Home - Away` now shows in everyone's Family calendar as `⚽ Emma: Home - Away`.
 Training sessions and matches Emma is not selected for stay out. When the match is rescheduled, the entry
 moves. When the call-up is withdrawn, the source title loses the `⭐ Udtaget: ` prefix, no longer matches
 the filter, and the entry disappears from the Family calendar.
 
-From KampKlar 0.7.0 a match carries its address as location and a `Kort: https://maps.apple.com/?ll=...`
+From KampKlar 0.7.0 a match carries its address as location (0.8.0 adds it for tournaments too) and a `Kort: https://maps.apple.com/?ll=...`
 link in its description. [Place details](#location-details), on by default, then give the entry a map in
 Apple Calendar, and with [travel time](#travel-time) from Waze Travel Time its notes start with
 `Leave at 09:35 (about 25 min drive)`. If KampKlar starts events at the meeting time, the leave time is
@@ -394,6 +397,13 @@ python3.14 -m venv .venv
 
 The tests include an end-to-end test that starts a real Radicale server on a free local port and relays
 events from Home Assistant's local calendar into it, with a stand-in for the Waze Travel Time action.
+
+## Disclaimer
+
+Not affiliated with Apple, iCloud, Nextcloud, Radicale or Waze. The `X-APPLE-` properties this
+integration writes are undocumented, so what Apple Calendar does with them can change. Anything the relay
+writes into a shared calendar is visible to everyone that calendar is shared with, so think about what a
+source calendar's titles and descriptions say before relaying them.
 
 ## License
 

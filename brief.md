@@ -14,6 +14,12 @@ with a per-child prefix, plus the match's place and when to leave.
 
 ## Current state
 
+- v0.2.4 (2026-09-16): docs for public use. `docs/example-football-call-ups.md` is a complete worked
+  example (the source event KampKlar writes, every relay setting with the reason for it, the entry the
+  relay produces - rendered by the integration's own code with invented data - what the family sees on a
+  phone, and what happens when a match moves or a call-up is withdrawn), linked from the README, which
+  also gained a disclaimer about the undocumented Apple properties and about what a shared calendar
+  exposes. No code change.
 - v0.1.0 released 2026-09-15 and installed through HACS on the owner's production Home Assistant
   (2026.9.1); the account and first relay are set up there by the owner. Public repo, so no personal data.
 - v0.2.0 (GitHub issue #1, location details and when to leave) implemented locally on 2026-09-15: place
